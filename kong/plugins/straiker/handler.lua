@@ -3,7 +3,7 @@ local cjson = require "cjson.safe"
 
 local StraikerHandler = {
   PRIORITY = 950,
-  VERSION = "0.3.0",
+  VERSION = "0.3.1",
 }
 
 ------------------------------------------------------------
@@ -202,7 +202,7 @@ local function call_straiker(conf, payload)
   httpc:set_timeout(conf.timeout)
   local body_json = cjson.encode(payload)
   -- payload includes user prompts; logged at DEBUG only
-  ngx.log(ngx.NOTICE, "[straiker] sending payload: ", body_json)
+  ngx.log(ngx.DEBUG, "[straiker] sending payload: ", body_json)
   local res, err = httpc:request_uri(detect_url(conf), {
     method = "POST",
     body = body_json,
@@ -248,13 +248,18 @@ function StraikerHandler:access(conf)
 
   if conf.mode == "post_call" then return end
 
-  -- Agentic apps: skip pre-call entirely. The agent loop runs server-side
-  -- and the post-call payload carries the full conversation (system, user,
-  -- assistant tool_calls, tool results, final assistant message), so a
-  -- pre-call hook produces an empty-response duplicate turn in the Console
-  -- without protecting anything new. Standard chatbot routes (agentic=false)
-  -- still get pre-call gating for inline blocking.
-  if conf.agentic then return end
+  -- Agent-loop dedupe: in agentic mode, skip pre-call only on continuation
+  -- iterations of the agent loop (last message is a tool result or an
+  -- intermediate assistant turn). Pre-call STILL fires on the first iteration
+  -- where the last message is real user input -- that's the right point to
+  -- block obviously bad prompts before the agent starts working. This keeps
+  -- gateway-level blocking working for agentic routes without producing the
+  -- empty-response duplicate turns we'd see if pre-call ran every iteration.
+  local last_msg = body.messages and body.messages[#body.messages]
+  if conf.agentic and last_msg
+     and (last_msg.role == "tool" or last_msg.role == "assistant") then
+    return
+  end
 
   local payload = build_payload({
     conf = conf,
@@ -290,6 +295,12 @@ function StraikerHandler:access(conf)
   kong.log.notice("[straiker] pre-call score=", score, " turn_id=", (result.turn_id or result.turnId or "n/a"))
 
   if score > conf.threshold then
+    -- Mark the request as blocked so the log phase skips post-call detection.
+    -- Without this flag, body_filter buffers the 403 error JSON we're about
+    -- to emit, sets app_response to "" (which is truthy in Lua), and the log
+    -- phase fires a phantom post-call turn for a request that never reached
+    -- the upstream model.
+    kong.ctx.plugin.blocked = true
     return kong.response.exit(403, {
       error = {
         message = "Straiker: threat detected (pre-call)",
@@ -339,7 +350,11 @@ end
 function StraikerHandler:log(conf)
   if conf.mode == "pre_call" then return end
   if not kong.ctx.plugin.prompt then return end
-  if not kong.ctx.plugin.app_response then return end
+  -- Skip post-call detection on requests blocked at pre-call. The upstream
+  -- never ran, so there is no real response to score; firing post-call here
+  -- would create a phantom Console turn with empty content.
+  if kong.ctx.plugin.blocked then return end
+  if kong.ctx.plugin.app_response == nil or kong.ctx.plugin.app_response == "" then return end
 
   -- Agent-loop dedupe: in agentic mode, skip post-call detection on any
   -- iteration where the model still wants to call a tool. Only fire on the

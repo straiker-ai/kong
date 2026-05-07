@@ -1,5 +1,5 @@
 package = "kong-plugin-straiker"
-version = "0.3.0-1"
+version = "0.3.1-1"
 supported_platforms = { "linux", "macosx" }
 source = {
    url = "file://./",

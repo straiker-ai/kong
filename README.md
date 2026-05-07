@@ -1,13 +1,15 @@
-# Straiker Kong Plugin — Design & Operations Notes
+# Straiker Kong Plugin — Design, Flow Matrix & Operations
 
 A Lua plugin that runs inside Kong Gateway and calls Straiker
 `POST /api/v1/detect` (or `/api/v1/detect?agentic`) on every AI request flowing
 through Kong. Intended as the production protection point in front of OpenAI,
 Anthropic, Bedrock, etc.
 
-This document covers the design decisions a model-gateway operator needs to
-understand before deploying the plugin — most importantly, why agentic apps
-behave differently from chatbots and how to configure each.
+This document is the source of truth on how the plugin behaves. Read sections
+1–3 to understand the architecture; section 4 is the **flow matrix** that
+explains exactly what shows up in the Straiker Console for every combination
+of route type (chatbot vs agentic), control mode (detect vs block), and
+request outcome (allowed vs blocked).
 
 ---
 
@@ -17,126 +19,142 @@ Kong separates **what the plugin is** from **where it runs**:
 
 | Concept | Where it lives | Set once, or per route? |
 |---|---|---|
-| Plugin install (the code) | `/opt/kong/plugins/straiker/{handler,schema}.lua` | Once per Kong instance |
+| Plugin install (the code) | LuaRocks artifact installed into Kong's standard plugin path | Once per Kong instance |
 | Plugin **attachment** (the config) | `kong.yml` services/routes block, or Admin API | Per route — each attachment gets its own `config: { ... }` |
+
+Recommended install (one command, any Kong instance OSS/Enterprise/Konnect data plane):
+
+```bash
+luarocks install https://github.com/PhimmStraiker/kong-plugin-straiker/releases/download/v0.3.1/kong-plugin-straiker-0.3.1-1.all.rock
+export KONG_PLUGINS=bundled,straiker     # or in kong.conf
+kong reload
+```
 
 The `agentic` flag, the API key, the threshold, the mode — all of it lives on
 the attachment. One Kong install can attach the plugin to a chatbot route with
 `agentic: false` and to an agent route with `agentic: true` simultaneously.
-Two routes, two configs, two Straiker apps in the Console.
-
-```yaml
-services:
-  - name: chatbot
-    url: https://api.openai.com
-    routes: [{paths: [/chatbot]}]
-    plugins:
-      - {name: straiker, config: {api_key: "...", agentic: false, mode: "both"}}
-
-  - name: support-agent
-    url: https://api.openai.com
-    routes: [{paths: [/support-agent]}]
-    plugins:
-      - {name: straiker, config: {api_key: "...", agentic: true,
-                                  source: "Support Agent",
-                                  destination: "api.openai.com"}}
-```
 
 ---
 
-## 2. Agentic vs non-agentic — what changes
+## 2. Two route shapes
 
-The single config flag `agentic: true|false` changes four things:
+| Shape | `agentic` config | Endpoint | When to use |
+|---|---|---|---|
+| **Chatbot** | `false` | `POST /api/v1/detect` | Single-shot completions: chatbots, RAG Q&A, copilots whose retrieval happens inside the customer's app before the OpenAI call |
+| **Agentic** | `true` | `POST /api/v1/detect?agentic` | OpenAI tool / function calling, LangChain/LangGraph/OpenAI Agents SDK, anything that loops Kong → OpenAI multiple times for one user prompt |
 
-| Behavior | `agentic: false` (chatbot) | `agentic: true` (agent) |
+You can run both side-by-side in one Kong, attached to different routes.
+
+---
+
+## 3. How blocking actually works
+
+**Blocking = the plugin returns HTTP 403 to the client before forwarding upstream.**
+
+Sequence:
+
+1. Client → Kong → plugin's `access` phase.
+2. Plugin sends the request payload to Straiker (`/api/v1/detect` for chatbot routes, `/api/v1/detect?agentic` for agentic routes).
+3. Straiker runs all configured controls, returns response with `score` field.
+4. **If `score > config.threshold` (default 0.5):** plugin calls `kong.response.exit(403, ...)` — Kong returns 403 to the client, OpenAI is **never** called.
+5. **If `score ≤ threshold`:** plugin lets the request flow through to OpenAI. After the OpenAI response comes back, the plugin asynchronously fires a *second* detect call (post-call observability) so the response content is also analysed.
+
+Two important notes:
+
+- **`detect` vs `block` mode is set in the Straiker Console**, per control, on the application. `detect` triggers don't change the `score` enough to cross the threshold; `block` triggers do. The plugin doesn't know which mode any individual control is in — it only sees the aggregate `score` Straiker returned.
+- **Pre-call hook runs only on the first iteration of an agent loop** (when `messages[-1].role == "user"`). On continuation iterations (last message is a tool result or intermediate assistant reasoning), pre-call is skipped to avoid duplicate Console turns from one logical user interaction.
+
+---
+
+## 4. Flow Matrix — what shows in Console for every combination
+
+**Notation:** "1 turn = 1 pre + 0 post" means the Console will show **one** row in Activity, created from the pre-call detect API call. "2 turns = 1 pre + 1 post" means **two** rows for one user interaction (the input pre-call and the response post-call).
+
+### 4.1 Chatbot route (`agentic: false`)
+
+| Scenario | Pre-call fires? | Post-call fires? | HTTP code | Console turns | What you see |
+|---|---|---|---|---|---|
+| Benign prompt, all controls in detect | ✅ score=0 | ✅ score=0 | 200 | **2** (1 pre + 1 post) | Pre-call: prompt, no badges. Post-call: prompt + assistant response, no badges. |
+| Benign prompt, controls in block | ✅ score=0 | ✅ score=0 | 200 | **2** (1 pre + 1 post) | Same as above. Block mode only fires on flagged content; benign content isn't blocked. |
+| Adversarial prompt, control in **detect** mode | ✅ score=1 | ✅ score=1 | 200 | **2** (1 pre + 1 post) | Pre-call: prompt with red violation badge (e.g. "LLM Evasion"). Post-call: prompt + response with same badge. Model still answered. |
+| Adversarial prompt, control in **block** mode | ✅ score=1, blocks | ❌ skipped (request never reached upstream) | **403** | **1** (1 pre, 0 post) | Pre-call turn with prompt + empty response box. Should display block indicator (Eng item — see §6). Body of 403 returned to client carries `turn_id`, `score`, message. |
+
+### 4.2 Agentic route (`agentic: true`) — single-iteration call (no tools)
+
+This is the case where the customer's "agent" doesn't actually use tool calling — it's effectively the same wire shape as a chatbot, just routed through `/detect?agentic`.
+
+| Scenario | Pre-call fires? | Post-call fires? | HTTP code | Console turns |
+|---|---|---|---|---|
+| Benign prompt, controls in detect | ✅ score=0 | ✅ score=0 | 200 | **2** (1 pre + 1 post) |
+| Adversarial prompt, control in detect | ✅ score=1 | ✅ score=1 | 200 | **2** (1 pre + 1 post) |
+| Adversarial prompt, control in block | ✅ score=1, blocks | ❌ skipped | **403** | **1** |
+
+### 4.3 Agentic route (`agentic: true`) — multi-iteration agent loop
+
+The agent makes N sequential OpenAI calls to fulfil one user prompt: user message → assistant tool_calls → tool result → assistant tool_calls → tool result → final assistant content. Each OpenAI call is a separate Kong request.
+
+The plugin dedupes:
+
+- **Pre-call** fires only on iteration 1 (when `messages[-1].role == "user"`). Iterations 2..N are continuations (last message is `tool` or intermediate `assistant`), pre-call is skipped on those.
+- **Post-call** fires only on the iteration where the response has no `tool_calls` — i.e. the final-answer iteration. Intermediate tool-call-only responses skip post-call.
+
+Per logical user interaction, regardless of how many tool iterations the agent runs:
+
+| Scenario | Total Console turns | What's in them |
 |---|---|---|
-| Straiker endpoint | `POST /api/v1/detect` | `POST /api/v1/detect?agentic` |
-| Request body shape | `prompt` + `app_response` strings | full OpenAI `messages[]` array |
-| Pre-call hook (block before upstream) | runs on every request | **skipped** (see §3) |
-| Post-call hook (observability) | runs on every response | runs only on the final-answer iteration of an agent loop |
-| Detection categories | full standard catalog (PII split input/output, custom controls, payment, third_party) | agentic-only controls (tool_misuse, malicious_user_session, improper_output_handling, hallucination_in_rag) |
+| Benign prompt, controls in detect | **2** | Pre-call (with full `messages[]` at iteration 1) + post-call (with full `messages[]` at final iteration, including all `tool_calls` and tool results inline as Agentic Steps) |
+| Adversarial prompt, control in detect | **2** | Same shape, both turns flagged with the violating control |
+| Adversarial prompt, control in **block** mode | **1** | Pre-call only — request never reached the agent loop. HTTP 403 to client. |
 
-The choice depends on how the customer's app talks to OpenAI. See §6.
+### 4.4 Multi-prompt session (same user, multiple consecutive prompts)
 
----
+A user has a long conversation: prompt 1 → response 1 → prompt 2 → response 2 → prompt 3 → response 3. Same `x-session-id` on every Kong call.
 
-## 3. Why agentic mode runs post-call only
+| Per prompt | Total turns for the session |
+|---|---|
+| Each prompt produces 2 turns (pre + post) if allowed, 1 turn if blocked | 2 × (allowed prompts) + 1 × (blocked prompts) |
 
-A standard chatbot is one HTTP call: `user prompt → response`. Pre-call gates
-the prompt; post-call captures the response. Two hooks, two real value-adds.
+Filtering Activity by `session_id` shows the whole timeline.
 
-An **agent** loops:
+### 4.5 Multi-agent / multi-model (one user prompt → researcher agent + writer agent)
 
-```
-client → OpenAI: messages = [system, user]
-OpenAI → client: assistant.tool_calls = [...]      ← intermediate
-client runs the tool
-client → OpenAI: messages = [..., tool_result]
-OpenAI → client: assistant.tool_calls = [...]      ← intermediate
-client runs the tool
-client → OpenAI: messages = [..., tool_result_2]
-OpenAI → client: assistant.content = "..."         ← final answer
-```
+One user prompt fans out across two specialised agents on two different models. Same `session_id`, distinct `agent_role` on each call.
 
-Kong sees **N** sequential calls for **one** logical user interaction. If the
-plugin fires both pre-call and post-call on each iteration:
+| Per agent | Total turns for the user interaction |
+|---|---|
+| Each agent produces 1 pre + 1 post if allowed, or 1 pre if blocked | 4 turns total when both agents allowed (2 per agent), 1 turn if the first agent's input was blocked |
 
-- Pre-call iter 1 — fine (real user input)
-- Pre-call iter 2 — duplicate; just a tool result coming back, not new input
-- Pre-call iter N — duplicate
-- Post-call iter 1..N-1 — empty assistant content (model is calling tools, not answering)
-- Post-call iter N — full final answer
-
-That's the source of the "before/after blank" duplicates customers see in the
-Console. **Same problem Portkey hit at Coupang.**
-
-The plugin's rule: when `agentic: true`, **skip pre-call entirely** and only
-fire post-call on the iteration where the model returns final assistant content
-(no `tool_calls`). One logical interaction → one Straiker turn per OpenAI hop,
-each carrying the full conversation history up to that point.
-
-Pre-call gating still runs for chatbot-style routes (`agentic: false`). It is
-specifically the agent-loop case where pre-call is noise without protective
-value — by the time the agent's loop is running, the request has already been
-inside the customer's app process.
-
-If a customer needs *first-input* gating on an agent (rare; usually handled
-inside the app), they can attach a second non-agentic route just for that,
-or run a separate edge plugin upstream of Kong.
+The `metadata.trace_id` and `metadata.agent_role` fields stitch the trace in the Console — filter Activity by `trace_id` to see all hops in time order.
 
 ---
 
-## 4. Schema — what the plugin sends to Straiker
+## 5. What gets sent to Straiker on every call
 
-### Standard `/api/v1/detect`
+### Chatbot (`/api/v1/detect`) payload
 
 ```json
 {
   "prompt":       "<last user message>",
-  "app_response": "<assistant's content>",
+  "app_response": "<assistant content (post-call only; 'N/A' on pre-call)>",
   "rag_content":  "N/A",
-  "session_id":   "...",
-  "user_name":    "...",
-  "user_role":    "...",
+  "session_id":   "<x-session-id header or fallback>",
+  "user_name":    "<resolved identity>",
+  "user_role":    "<x-user-role header or 'public'>",
   "metadata": {
-    "session_id": "...",
-    "user_name":  "...",
-    "user_role":  "...",
-    "remote_ip":  "...",
-    "app_name":   "<plugin source>",
+    "session_id": "...", "user_name": "...", "user_role": "...",
+    "remote_ip":  "...", "app_name":  "<plugin source>",
     "source":     "kong-plugin",
-    "trace_id":   "<x-trace-id header>",
-    "agent_role": "<x-agent-role header>"
+    "trace_id":   "<x-trace-id>",  "agent_role": "<x-agent-role>"
   },
   "network":      { "IP": "...", "User-Agent": "...", "Content-Type": "..." },
-  "annotations":  { "source": "kong-plugin", "model": "...", "hook": "post_call",
+  "annotations":  { "source": "kong-plugin", "model": "...", "hook": "<pre|post>_call",
                     "trace_id": "...", "agent_role": "..." }
 }
 ```
 
-### Agentic `/api/v1/detect?agentic`
+### Agentic (`/api/v1/detect?agentic`) payload
 
-Same envelope, plus a flat OpenAI-style `messages[]`:
+Same envelope, plus the full conversation `messages[]`:
 
 ```json
 {
@@ -146,147 +164,124 @@ Same envelope, plus a flat OpenAI-style `messages[]`:
     {"role": "system",    "content": "..."},
     {"role": "user",      "content": "..."},
     {"role": "assistant", "tool_calls": [
-        {"id": "call_abc", "name": "lookup_order", "input": {"order_id": "ORD-4421"}}
+      {"id": "call_abc", "name": "lookup_order", "input": {"order_id": "ORD-4421"}}
     ]},
     {"role": "tool", "tool_call_id": "call_abc", "tool_name": "lookup_order",
-                     "content": "{\"customer\": \"...\"}"},
+                     "content": "{\"customer\":\"...\"}"},
     {"role": "assistant", "content": "Your order shipped on Tuesday."}
   ],
   "session_id":   "...",
   "user_name":    "...",
-  "metadata":     { /* same envelope as above */ },
-  "annotations":  { /* same as above */ }
+  "metadata":     { /* same envelope as chatbot */ },
+  "annotations":  { /* same as chatbot */ }
 }
 ```
 
-### Tool-call reshape
-
-OpenAI returns:
-
-```json
-{"id": "...", "type": "function",
- "function": {"name": "...", "arguments": "<stringified-json>"}}
-```
-
-Straiker's agentic API expects:
-
-```json
-{"id": "...", "name": "...", "input": <parsed object>}
-```
-
-The plugin reshapes on the wire. Without this, the Console can't render tool
-names or arguments because it looks up `name` and `input` directly on each
-tool_call entry.
+OpenAI's native tool_calls format (`{id, type, function:{name, arguments:"<json>"}}`) is **reshaped on the wire** to Straiker's flat format (`{id, name, input:<object>}`). Without that reshape the Console can't render tool names or arguments.
 
 ---
 
-## 5. Identity, session, and trace correlation
+## 6. Open issues for Eng (verified against production app 1614)
 
-The plugin resolves a `user_name` for every request by walking a fallback
-chain. Higher-trust sources win:
+These are observations from a 152-turn data export from app 1614 (CSV from `/applications/defend/1614/activity` → Download Prompts). Plugin behavior is correct; the gaps below are on the Straiker side.
 
-1. **`x-user-name` header** — set by an upstream identity gateway. Recommended.
-2. **Kong consumer** — if Kong's `key-auth`, `jwt`, or `oauth2` plugins
-   authenticated the call, `consumer.username` (or `custom_id`) is used.
-3. **OpenAI `user` field** in the request body (the standard
-   `{"user": "<id>"}` field used for OpenAI's own abuse tracking).
-4. Fallback: literal `kong`.
+### 6.0 `LLM Evasion` (prompt-injection control) over-fires on agentic apps in block mode
 
-Two additional headers stitch a multi-step / multi-agent interaction into a
-single trace in the Console:
+**Symptom:** Putting the **LLM Evasion** control in `block` mode on an agentic-type Straiker application produces frequent false positives on benign content. Verified examples that returned `score: 1` from the agentic API with `block.llm_evasion: 1`:
 
-| Header | Purpose |
-|---|---|
-| `x-session-id` | Stable identifier for one logical user conversation. Same value across every Kong → OpenAI hop in that conversation. |
-| `x-trace-id` | Optional second correlator; useful if the customer already issues W3C trace IDs from their agent runtime. |
-| `x-agent-role` | Free-form label (e.g. `researcher`, `writer`) so multi-agent flows can be visually distinguished in the Console. |
+- `"What is 17 times 19 plus 23?"` (math)
+- `"How do you say hello in Spanish?"` (translation)
+- `"hello"` (one-word greeting)
 
-A multi-agent / multi-model interaction (one user prompt → researcher agent on
-gpt-4o-mini → writer agent on gpt-4o) becomes **N Straiker turns sharing one
-`session_id`**, each tagged with its `agent_role` and `model`. Filter Activity
-by `session_id` to see the whole timeline.
+**Plugin-side behavior is correct:** when Argus returns `score: 1`, the plugin honors it and returns HTTP 403 — verified across 5/5 round-trip tests. **The issue is detection-side**, not gateway-side. Detect mode returns the same violations but does not block, so the FP rate is invisible until block mode is enabled.
+
+**Recommendation for new agentic deployments:**
+
+1. Start with **all controls in detect mode** for the first week of monitoring. Inspect Activity for violation patterns and tune sensitivity per control.
+2. Only flip a control to **block mode** after you've reviewed its detect-mode firings on real traffic and confirmed the FP rate is acceptable for that specific app.
+3. **Be especially cautious with LLM Evasion in block mode on agentic apps.** It's the single biggest FP risk and will block normal user questions like "what's the weather" or "how do I do X". If you must enable it in block mode, raise the threshold or scope it to a narrow subset of routes first.
+4. Customer-facing UX impact of an over-firing control in block mode is severe — every blocked request returns HTTP 403 to the end user with no model response. Validate carefully before enabling.
+
+This is an Eng / detection-tuning concern. The plugin and its Argus integration are working as designed; tuning belongs to the Detection / Models team.
+
+### 6.1 `user_name` is dropped on the agentic ingest path
+
+**Symptom:** Every persisted turn record on `/detect?agentic` has `user_name = "user"` literal, regardless of what the plugin sent in `metadata.user_name` or top-level `user_name`. Confirmed across 152 turns: **152/152 have `user_name = "user"`**, despite payloads carrying `alice@acme.com`, `dan@acme.com`, `clean-user-1778176029@acme.com`, etc.
+
+**Plugin-side proof:** plugin debug logs show outgoing payloads with the correct identity. Direct API probes (no Kong, no plugin) bypassing the gateway also persist as `user_name = "user"` — so this is purely an agentic ingest issue, not a plugin issue. Standard `/detect` (non-agentic) preserves `user_name` correctly.
+
+**Impact:** No per-user attribution on agentic turns. UBA, forensics, per-user policy all useless on agentic apps until fixed.
+
+**Test turn IDs to investigate:**
+- `pf-a3fa5802-d8e7-4e86-9489-19608ab35e86` — sent `metadata.user_name: "schema-verify-zachary@acme.com"`
+- `pf-e2df3162-3c61-4f71-9446-202b170c0e3a` — sent top-level `user_name: "schema-verify-yoshi@acme.com"`
+
+### 6.2 Block-mode triggers don't render distinctly in Console Activity
+
+**Symptom:** When a control is in `block` mode and fires, the gateway correctly returns HTTP 403 with `score: 1` in the API response. The persisted Turn record exists with the right prompt and metadata. **But the Activity row shows no visual distinction from a benign turn** — no "blocked" badge, no red label, no shield icon. The empty assistant-response box is the only hint.
+
+In contrast, `detect`-mode triggers correctly render their violation badge (e.g. "LLM Evasion" in red) on the Activity row.
+
+**Impact:** Security teams reviewing Activity can't distinguish a block from a hung benign request. Demo confusion (the customer's first reaction was "did the model not answer?").
+
+**Ask:** Add a `[BLOCKED]` chip or red border to Activity rows where the API call to `/detect?agentic` resulted in `score_block > 0`, separate from in-detect-mode tag rendering.
+
+### 6.3 Block-mode trigger details may not be persisted into the Turn verdict
+
+**Symptom (needs Eng confirmation, not certain):** Looking at the debug panel of a turn that we *know* was blocked at the gateway (HTTP 403, plugin received `score: 1` from the API), the persisted Turn shows `score: 0`, `score_block: 0`, `verdict.detections: []`. The block decision came back to the plugin instantly but doesn't seem reflected in the indexed record.
+
+**Caveat:** `phimm@straiker.ai` (the user) reasonably pushed back on this, saying architecturally Argus should record what it returned. So it's possible the Console UI reads from a partial projection that doesn't include block-mode results, while the underlying record is correct. **Eng to confirm whether the indexed Turn does or doesn't reflect block-mode triggers**, and if not, fix or document the projection mismatch.
+
+The `/api/v1/score?turn_id=…` lookup endpoint returns 404 for `pf-`-prefixed agentic turn IDs (it expects UUID4), so this can't be independently verified outside the Console UI today. Adding agentic-ID support to the score endpoint would help.
+
+### 6.4 Multi-turn sessions need explicit `x-session-id` from the client
+
+**Symptom:** All 152 turns in the export had distinct `session_id` values. None grouped into multi-turn sessions even though some were multi-iteration agent loops or multi-prompt conversations.
+
+**Cause:** The plugin's `session_id` resolution is `x-session-id header → ngx.var.request_id → "kong-session"`. `ngx.var.request_id` is per-Kong-request, not per-conversation, so without an explicit header the plugin reports each request as a fresh session.
+
+**Customer guidance (already in the plugin docs):** Have the calling app always set `x-session-id` to a stable value for one logical conversation. The doc tells them to do this, but it's worth flagging as a real-world gotcha — if they don't, they lose multi-turn correlation in the Console.
 
 ---
 
-## 6. What Kong actually sees on the wire
+## 7. Identity, session, and trace correlation (operator reference)
 
-Kong is a passive observer of `POST /v1/chat/completions`. The visibility you
-get from the agentic mode depends entirely on how the customer's app talks to
-OpenAI:
+Headers the plugin reads from the upstream client request and forwards to Straiker:
 
-| Customer architecture | Kong sees | Use `agentic` mode? |
+| Header | Straiker field | Purpose |
 |---|---|---|
-| Single-shot chat (RAG / lookups happen inside the app, then one OpenAI call) | One request per user turn, no tool_calls in the body | **No.** `agentic: false`; richer detection catalog applies. |
-| Tool / function calling at the OpenAI boundary (LangChain, OpenAI Agents SDK, custom loops) | N sequential requests per user turn, full tool_calls + tool results in `messages[]` | **Yes.** `agentic: true`; full agent trace in the Console. |
-| Streaming responses (`stream: true`) | Pre-call still works; post-call body capture currently doesn't parse SSE | Agentic post-call hook will silently no-op; pre-call gating still fine. |
-| OpenAI Assistants / Responses API (stateful threads) | Different URL paths and IDs (`thread_id`, `previous_response_id`) — the plugin only handles Chat Completions today | Out of scope for current plugin version. |
-
-Recommend a **canary capture** before flipping anything to block: deploy with
-`mode: post_call`, `threshold: 1.0` (never blocks), send 50–100 real
-production turns, inspect 10 random ones in the Console. Confirm Agentic Steps
-shows tool calls and tool results before tightening.
+| `x-user-name` | `metadata.user_name` (and top-level) | End-user identity. Falls back to Kong consumer username/custom_id, then OpenAI `user` body field, then `"kong"`. |
+| `x-user-role` | `metadata.user_role` | Role label for RBAC-aware controls. Defaults to `"public"`. |
+| `x-session-id` | `metadata.session_id` | Stable session identifier. Same value on every Kong → OpenAI hop in one logical conversation. |
+| `x-trace-id` | `metadata.trace_id` (and `annotations.trace_id`) | Optional distributed-trace identifier. Useful when the agent runtime already issues W3C Trace Context. |
+| `x-agent-role` | `metadata.agent_role` (and `annotations.agent_role`) | Free-form label (`researcher`, `writer`, etc.) so multi-agent flows can be distinguished. |
 
 ---
 
-## 7. Operational gotchas
+## 8. Operational gotchas
 
-- **Response decompression.** OpenAI returns `Content-Encoding: gzip` (or `br`)
-  by default. The plugin's `body_filter` buffers raw bytes; gzipped bytes don't
-  parse as JSON. The plugin sets `Accept-Encoding: identity` on the upstream
-  request so OpenAI returns plain JSON. Without this, post-call captures the
-  prompt but not the response.
-- **Cosockets in `body_filter`.** Kong forbids cosocket I/O (HTTP requests) in
-  the body_filter phase. The plugin defers post-call detection to
-  `ngx.timer.at(0, …)` from the log phase, where cosockets are allowed.
-- **`Content-Length` rewrite.** The plugin clears `ngx.header.content_length`
-  in `header_filter` so the buffered body can be re-emitted unchanged after
-  inspection.
-- **Payload logging.** The plugin logs the outgoing Straiker payload at
-  `DEBUG` level only. Production deployments do not write user prompts (or any
-  PII therein) to nginx access logs by default.
-- **DB-less Kong reload.** Use `curl -X POST http://localhost:8001/config -F
-  config=@kong.yml` to hot-apply schema changes; `PATCH` is not supported.
-- **`api_key` storage.** Declared `encrypted = true` and `referenceable =
-  true`, so Kong stores it encrypted at rest and resolves `{vault://...}`
-  references for production deployments.
+- **Response decompression.** OpenAI returns `Content-Encoding: gzip` (or `br`) by default. Plugin sets `Accept-Encoding: identity` upstream so `body_filter` sees parseable JSON.
+- **Cosockets in `body_filter`.** Kong forbids cosocket I/O in body_filter. Plugin defers post-call detection to `ngx.timer.at(0, …)` from the log phase.
+- **`Content-Length` rewrite.** Plugin clears `ngx.header.content_length` in `header_filter` so the buffered body re-emits correctly.
+- **Payload logging.** Outgoing Straiker payload is logged at `DEBUG` only. Production deployments don't write user prompts to nginx access logs by default.
+- **DB-less Kong reload.** Use `curl -X POST http://localhost:8001/config -F config=@kong.yml`; `PATCH` is not supported.
+- **`api_key` storage.** Declared `encrypted = true` and `referenceable = true`, so Kong stores it encrypted at rest and resolves `{vault://...}` references for production deployments.
 
 ---
 
-## 8. Configuration reference
+## 9. Configuration reference
 
 | Field | Default | Description |
 |---|---|---|
 | `api_key` | (required) | Straiker Defend AI API key. Encrypted at rest. |
 | `detect_url` | `https://api.prod.straiker.ai/api/v1/detect` | Straiker endpoint. Override for regional deployments. |
-| `mode` | `both` | `pre_call`, `post_call`, or `both`. Ignored on agentic — agentic always runs post-call only. |
-| `agentic` | `false` | When `true`, calls `/detect?agentic`, forwards full `messages[]` (tool_calls included), runs post-call only. |
-| `source` | `kong-plugin` | Agentic application name. Must match an existing agentic Straiker app, otherwise a new one auto-creates on first request. |
+| `mode` | `both` | `pre_call`, `post_call`, or `both`. Applies to chatbot routes only. Agentic routes always run pre+post per the §4.3 dedupe rules. |
+| `agentic` | `false` | When `true`, calls `/detect?agentic`, forwards full `messages[]` (tool_calls reshaped). Pre-call fires only on first iteration of agent loop; post-call only on final-answer iteration. |
+| `source` | `kong-plugin` | Agentic application name. Must match an existing agentic Straiker app. |
 | `destination` | `api.openai.com` | Upstream provider hostname, recorded in agentic detection metadata. |
 | `threshold` | `0.5` | Minimum score to block. Higher = more permissive. |
 | `timeout` | `5000` | Straiker call timeout in milliseconds. |
 | `fail_open` | `false` | When `true`, allow traffic through if Straiker is unreachable. |
-
----
-
-## 9. Quick decision matrix
-
-> "Should I configure `agentic: true` for this route?"
-
-```
-Does the customer's app use OpenAI tool / function calling?
-├── No  → agentic: false. Pre-call + post-call on every request.
-│         Get the full standard control catalog (input/output PII split,
-│         custom controls, payment, third_party, llm_evasion, etc.).
-│
-└── Yes → agentic: true. Post-call only, deduped to final iteration.
-          Tool calls and tool results render in Console "Agentic Steps".
-          Get agentic-only controls (tool_misuse, malicious_user_session,
-          improper_output_handling, hallucination_in_rag).
-```
-
-If unsure, start with `agentic: false, mode: post_call, threshold: 1.0`,
-inspect a week of traffic, then promote agent routes to `agentic: true` once
-you confirm the calls actually carry `messages[]` with tool_calls in them.
 
 ---
 
@@ -298,3 +293,4 @@ you confirm the calls actually carry `messages[]` with tool_calls in them.
 - Public docs: <https://docs.straiker.ai/defend-ai/kong-gateway-integration>
 - Detect API reference: <https://docs.straiker.ai/api-reference/defend-ai-api>
 - Detect-agentic API reference: <https://docs.straiker.ai/api-reference/defend-ai-api/detect-agentic>
+- Plugin GitHub repo & releases: <https://github.com/PhimmStraiker/kong-plugin-straiker>
