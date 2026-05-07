@@ -1,0 +1,4 @@
+build/
+luarocks/
+*.tar.gz
+.DS_Store
