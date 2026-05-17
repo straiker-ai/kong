@@ -6,3 +6,5 @@ luarocks/
 .env.*
 !.env.example
 __pycache__/
+*.all.rock
+*.rock
