@@ -47,6 +47,10 @@ return {
               type = "boolean",
               default = false,
             } },
+          { ai_proxy_advanced_compat = {
+              type = "boolean",
+              default = false,
+            } },
         },
     } },
   },

@@ -1,0 +1,170 @@
+{/*
+This file is a DRAFT for inserting into docs/defend-ai/kong-gateway-integration.mdx
+as a new section "Path 1b: Kong Konnect (cloud control plane)" — sibling of
+the existing "Path 1: Plugin (recommended)" section.
+
+Screenshots needed are listed at the bottom under "SCREENSHOTS TODO".
+*/}
+
+## Path 1b: Kong Konnect (cloud control plane)
+
+Konnect is Kong's cloud-managed control plane; gateway data planes run on your own infrastructure as Docker containers, Linux binaries, or Kubernetes pods. The Straiker plugin works on Konnect-managed data planes the same way it works on self-managed Kong, with two extra steps: register the plugin schema with Konnect (so the UI knows how to render the config form), and bake the plugin into your data plane image.
+
+<Note>
+Konnect's **Dedicated Cloud Gateway** runtime does **not** allow custom plugins. To run the Straiker plugin, you must use **Self-Managed Hybrid** data planes, where Konnect hosts the control plane and you run the gateway runtime on your own infrastructure.
+</Note>
+
+### Prerequisites
+
+- A Konnect account ([cloud.konghq.com](https://cloud.konghq.com)) on any plan that supports custom plugins
+- Docker installed on the machine that will run the data plane
+- A Straiker Defend AI API key
+
+<Steps>
+  <Step title="Create a Self-Managed Hybrid gateway in Konnect">
+    In Konnect UI: **Gateway Manager → New API Gateway**. Pick **Self-Managed** as the runtime and **Docker** as the platform. Give it a name (for example `straiker-gateway`) and create.
+
+    Do not pick **Control Plane Group**. Groups are read-only aggregators and cannot host custom plugins.
+
+    {/* SCREENSHOT NEEDED: konnect-new-api-gateway.png — "New API gateway" form with Self-Managed + Docker selected */}
+  </Step>
+
+  <Step title="Register the Straiker custom plugin schema">
+    Inside the new control plane: **Plugins → Custom Plugins → Create Custom Plugin**.
+
+    - **Name:** `straiker`
+    - **Schema:** paste the contents of [`kong/plugins/straiker/schema.lua`](https://github.com/PhimmStraiker/kong-plugin-straiker/blob/main/kong/plugins/straiker/schema.lua)
+
+    The schema registration tells Konnect's UI how to render the plugin's config form. The plugin's Lua handler runs on the data plane (next step), not on Konnect.
+
+    {/* SCREENSHOT NEEDED: konnect-custom-plugins-create.png — Custom Plugins → Create form with schema pasted */}
+  </Step>
+
+  <Step title="Generate data plane certificates">
+    In the new control plane: **Data Plane Nodes → New Data Plane Node → Docker**. Click **Generate certificate and script**.
+
+    Konnect renders a `docker run …` command containing four values you need: the cluster control plane endpoint, the telemetry endpoint, a PEM certificate, and a PEM private key.
+
+    Copy those four values into a `.env` file:
+
+    ```bash
+    KONG_CLUSTER_CONTROL_PLANE=<id>.us.cp.konghq.com:443
+    KONG_CLUSTER_SERVER_NAME=<id>.us.cp.konghq.com
+    KONG_CLUSTER_TELEMETRY_ENDPOINT=<id>.us.tp.konghq.com:443
+    KONG_CLUSTER_TELEMETRY_SERVER_NAME=<id>.us.tp.konghq.com
+    KONG_CLUSTER_CERT='-----BEGIN CERTIFICATE-----
+    ...
+    -----END CERTIFICATE-----'
+    KONG_CLUSTER_CERT_KEY='-----BEGIN PRIVATE KEY-----
+    ...
+    -----END PRIVATE KEY-----'
+    ```
+
+    {/* SCREENSHOT NEEDED: konnect-data-plane-bootstrap.png — Generate certificate page with the docker run command visible */}
+  </Step>
+
+  <Step title="Build a data plane image with the Straiker plugin baked in">
+    Konnect's data plane runs `kong/kong-gateway:<version>`. You extend that image to include the Straiker plugin code so the data plane can load it at startup.
+
+    `Dockerfile.konnect`:
+
+    ```dockerfile
+    FROM kong/kong-gateway:3.14
+    USER root
+    RUN mkdir -p /usr/local/share/lua/5.1/kong/plugins/straiker
+    COPY kong/plugins/straiker/handler.lua /usr/local/share/lua/5.1/kong/plugins/straiker/handler.lua
+    COPY kong/plugins/straiker/schema.lua  /usr/local/share/lua/5.1/kong/plugins/straiker/schema.lua
+    USER kong
+    ```
+
+    Get the plugin source by cloning [`PhimmStraiker/kong-plugin-straiker`](https://github.com/PhimmStraiker/kong-plugin-straiker), or grab the published `.all.rock` and extract the two `.lua` files. The `lua-resty-http` runtime dependency is already present in Kong's base image.
+
+    Build:
+
+    ```bash
+    docker build -f Dockerfile.konnect -t straiker-konnect-dp:<your-tag> .
+    ```
+  </Step>
+
+  <Step title="Run the data plane">
+    Load the env file and run the container with `KONG_PLUGINS=bundled,straiker` so the plugin is enabled:
+
+    ```bash
+    set -a; source ./.env; set +a
+
+    docker run -d --name straiker-konnect-dp \
+      -e "KONG_ROLE=data_plane" \
+      -e "KONG_DATABASE=off" \
+      -e "KONG_CLUSTER_MTLS=pki" \
+      -e "KONG_CLUSTER_CONTROL_PLANE=${KONG_CLUSTER_CONTROL_PLANE}" \
+      -e "KONG_CLUSTER_SERVER_NAME=${KONG_CLUSTER_SERVER_NAME}" \
+      -e "KONG_CLUSTER_TELEMETRY_ENDPOINT=${KONG_CLUSTER_TELEMETRY_ENDPOINT}" \
+      -e "KONG_CLUSTER_TELEMETRY_SERVER_NAME=${KONG_CLUSTER_TELEMETRY_SERVER_NAME}" \
+      -e "KONG_CLUSTER_CERT=${KONG_CLUSTER_CERT}" \
+      -e "KONG_CLUSTER_CERT_KEY=${KONG_CLUSTER_CERT_KEY}" \
+      -e "KONG_LUA_SSL_TRUSTED_CERTIFICATE=system" \
+      -e "KONG_KONNECT_MODE=on" \
+      -e "KONG_ROUTER_FLAVOR=expressions" \
+      -e "KONG_PLUGINS=bundled,straiker" \
+      -p 8000:8000 -p 8443:8443 \
+      straiker-konnect-dp:<your-tag>
+    ```
+
+    In Konnect UI, **Data Plane Nodes** will show your container as **Connected** within about 15 seconds.
+
+    {/* SCREENSHOT NEEDED: konnect-data-plane-connected.png — Data Plane Nodes list showing the running node as Connected */}
+  </Step>
+
+  <Step title="Create a service, route, and attach plugins">
+    In Konnect UI: **Gateway Services → New Gateway Service**. Service URL is a placeholder if you'll front it with `ai-proxy-advanced`; otherwise point it at your upstream LLM directly.
+
+    Add a route on that service (path-based or expression-based — Konnect 3.14 defaults to expressions when `KONG_ROUTER_FLAVOR=expressions`).
+
+    Attach the **Straiker** plugin to the route:
+
+    | Field | Recommended | Notes |
+    |---|---|---|
+    | `api_key` | `<your Straiker key>` | Encrypted at rest by Konnect |
+    | `mode` | `both` (chatbot) / `post_call` (agentic) | See [Configuration options](#configuration-options) |
+    | `agentic` | `true` if the route fronts a tool-calling agent | Routes detect to `/detect?agentic` |
+    | `ai_proxy_advanced_compat` | `true` if the route also has `ai-proxy-advanced` attached | Enables SSE-aware response accumulator and gzip inflation; required for streaming routes behind AI Proxy Advanced |
+    | `threshold` | `0.5` | Score above which pre-call blocks |
+
+    {/* SCREENSHOT NEEDED: konnect-plugin-attach-form.png — Plugins → Add Plugin form for "straiker", showing the config fields including ai_proxy_advanced_compat */}
+  </Step>
+
+  <Step title="Send a request and verify in the Console">
+    ```bash
+    curl http://<your-data-plane-host>:8000/<your-route-path> \
+      -H "Content-Type: application/json" \
+      -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}'
+    ```
+
+    The Straiker Console shows the new turn under the application bound to your API key, with full request, response, and control violations.
+
+    {/* SCREENSHOT NEEDED: konnect-console-turn.png — Straiker Console Activity view for a Konnect-protected route (reuse existing defend-kong-plugin-console.png if it represents Konnect traffic) */}
+  </Step>
+</Steps>
+
+### Konnect + AI Proxy Advanced
+
+When the route also has Kong's `ai-proxy-advanced` plugin attached (any provider — OpenAI, Anthropic, Bedrock, Azure, Mistral, Gemini), set **`ai_proxy_advanced_compat: true`** on the Straiker plugin. This enables:
+
+- **SSE-aware response accumulator** — `ai-proxy-advanced` re-emits its own SSE chunks when streaming; the plugin concatenates `choices[0].delta.content` deltas into a single `app_response` before posting to `/detect`.
+- **Gzip inflation** — `ai-proxy-advanced` does not honor the client's `Accept-Encoding: identity` override on direct OpenAI traffic. The plugin detects `Content-Encoding: gzip` (or the gzip magic bytes) in `header_filter` and inflates with `kong.tools.gzip.inflate_gzip` before parsing.
+- **Lowered plugin priority** — the plugin runs at `PRIORITY = 760` so its `body_filter` runs *after* `ai-proxy-advanced` (`PRIORITY = 770`) has normalized the upstream-native response back to OpenAI shape.
+
+Without the flag, streamed responses behind AI Proxy Advanced land in the Console with empty `app_response` because the legacy single-shot JSON decode path cannot parse SSE chunks.
+
+---
+
+SCREENSHOTS TODO (capture from Konnect UI and Straiker Console; recommended viewport 1440x900, light mode):
+
+1. **konnect-new-api-gateway.png** — Konnect → Gateway Manager → "New API gateway" form, Self-Managed + Docker selected, name field filled.
+2. **konnect-custom-plugins-create.png** — Inside a CP → Plugins → Custom Plugins → Create form, with name "straiker" and the schema.lua content visible in the editor.
+3. **konnect-data-plane-bootstrap.png** — Inside a CP → Data Plane Nodes → "Create a data plane node" page, after clicking "Generate certificate and script", with the docker run command visible (PEM blocks can be redacted/blurred).
+4. **konnect-data-plane-connected.png** — Inside a CP → Data Plane Nodes list, showing the running node with status "Connected".
+5. **konnect-plugin-attach-form.png** — Inside a CP → Routes → <route> → Plugins → Add Plugin → Straiker, showing the config form with `ai_proxy_advanced_compat` toggle visible.
+6. **konnect-console-turn.png** — Straiker Console → Application Activity, showing a Console turn produced by traffic that flowed through a Konnect data plane (an Agentic Steps trace would be ideal).
+
+All screenshots go under `docs/images/defend-ai/`.

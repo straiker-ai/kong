@@ -25,7 +25,7 @@ Kong separates **what the plugin is** from **where it runs**:
 Recommended install (one command, any Kong instance OSS/Enterprise/Konnect data plane):
 
 ```bash
-luarocks install https://github.com/PhimmStraiker/kong-plugin-straiker/releases/download/v0.3.1/kong-plugin-straiker-0.3.1-1.all.rock
+luarocks install https://github.com/PhimmStraiker/kong-plugin-straiker/releases/download/v0.4.0/kong-plugin-straiker-0.4.0-1.all.rock
 export KONG_PLUGINS=bundled,straiker     # or in kong.conf
 kong reload
 ```
@@ -282,10 +282,88 @@ Headers the plugin reads from the upstream client request and forwards to Straik
 | `threshold` | `0.5` | Minimum score to block. Higher = more permissive. |
 | `timeout` | `5000` | Straiker call timeout in milliseconds. |
 | `fail_open` | `false` | When `true`, allow traffic through if Straiker is unreachable. |
+| `ai_proxy_advanced_compat` | `false` | Enable when the route also has `ai-proxy` / `ai-proxy-advanced` attached. Turns on the SSE-aware response accumulator so streamed `chat.completion.chunk` events are reassembled into a single `app_response` before posting to `/detect`. See §11. |
 
 ---
 
-## 10. References
+## 11. Kong AI Proxy Advanced compatibility (v0.4.0+)
+
+### Why this exists
+
+[Kong AI Proxy Advanced](https://developer.konghq.com/plugins/ai-proxy-advanced/)
+(Enterprise) is not a passthrough — it normalizes provider-native requests
+(Bedrock, Anthropic, Azure, Gemini, Mistral…) into OpenAI shape, and on the
+response path it **owns the response body**: it buffers upstream bytes, runs
+format conversion in its own `body_filter`, and for `stream: true` it re-emits
+its own OpenAI-format SSE chunks (`data: {…}\n\n`). A naïve guardrail plugin
+that reads `ngx.arg[1]` in `body_filter` and decodes the buffer as a single
+JSON document sees nothing (race with ai-proxy-advanced's writer) or an SSE
+stream that is not valid JSON. Result: `app_response` is empty on the wire,
+the Straiker post-call detect call is skipped, and the Console shows
+request-only turns.
+
+### What v0.4.0 changes
+
+| Change | Effect |
+|---|---|
+| `PRIORITY` lowered from `950` → `760` | Plugin runs **after** `ai-proxy-advanced` (PRIORITY 770) in `body_filter`, so we read the already-normalized OpenAI response — not the raw upstream-native bytes. The original client request is still read via `ngx.req.get_body_data()`, which Kong preserves regardless of `kong.service.request.set_raw_body` rewrites. |
+| New `ai_proxy_advanced_compat` flag | Default `false` (legacy v0.3.x single-shot JSON decode). Set `true` to enable an SSE-aware accumulator that walks `data:` events, concatenates `choices[0].delta.content` deltas, and unions streamed `tool_calls` indices before posting to `/detect`. |
+
+### Route configuration
+
+```yaml
+services:
+  - name: openai-via-ai-proxy-advanced
+    url: http://placeholder.invalid    # ai-proxy-advanced rewrites the upstream
+    routes:
+      - name: chat
+        paths: [/chat]
+    plugins:
+      - name: ai-proxy-advanced
+        config:
+          targets:
+            - route_type: llm/v1/chat
+              model:
+                provider: openai
+                name: gpt-4o-mini
+                options: { max_tokens: 512 }
+              auth:
+                header_name: Authorization
+                header_value: Bearer ${OPENAI_API_KEY}
+      - name: straiker
+        config:
+          api_key: ${STRAIKER_API_KEY}
+          source: "kong-ai-proxy-advanced"
+          mode: both
+          agentic: false
+          threshold: 0.5
+          ai_proxy_advanced_compat: true   # <— required for streaming routes
+```
+
+### Agentic + ai-proxy-advanced
+
+Set both `agentic: true` and `ai_proxy_advanced_compat: true`. The same
+iteration-aware dedupe applies: pre-call only fires when `messages[-1].role`
+is `user`; post-call only fires when the streamed final assistant message
+carries no `tool_calls`. The SSE accumulator additionally reassembles
+streamed `tool_calls` deltas so the `has_tool_calls` signal is correct for
+agent-loop iterations that stream their tool calls.
+
+### Operational notes
+
+- The PRIORITY change is permanent (it's set at module load and can't be
+  per-route). Existing v0.3.x routes with no other AI plugin on the chain
+  will not see a behavior difference — there is no competing `body_filter`
+  consumer in that case. If you operate routes with other Kong-shipped AI
+  plugins (`ai-prompt-guard` 771, `ai-response-transformer` 768, etc.) and
+  rely on a specific ordering, validate with your existing test suite
+  before rolling v0.4.0.
+- For non-streaming routes (`stream: false`), the flag is a no-op — the
+  legacy single-shot JSON decode path runs and is unchanged from v0.3.x.
+
+---
+
+## 12. References
 
 - Plugin source: [`kong/plugins/straiker/handler.lua`](kong/plugins/straiker/handler.lua), [`schema.lua`](kong/plugins/straiker/schema.lua)
 - Multi-agent demo client: [`multi_agent_trace.py`](multi_agent_trace.py)

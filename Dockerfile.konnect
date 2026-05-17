@@ -1,0 +1,6 @@
+FROM kong/kong-gateway:3.14
+USER root
+RUN mkdir -p /usr/local/share/lua/5.1/kong/plugins/straiker
+COPY kong/plugins/straiker/handler.lua /usr/local/share/lua/5.1/kong/plugins/straiker/handler.lua
+COPY kong/plugins/straiker/schema.lua  /usr/local/share/lua/5.1/kong/plugins/straiker/schema.lua
+USER kong

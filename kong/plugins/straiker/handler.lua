@@ -1,9 +1,17 @@
 local http = require "resty.http"
 local cjson = require "cjson.safe"
+local kong_gzip = require "kong.tools.gzip"
 
+-- PRIORITY 760 puts us after Kong's ai-proxy / ai-proxy-advanced (PRIORITY 770)
+-- in body_filter, so we read the upstream response *after* ai-proxy-advanced
+-- has normalized provider-native bytes (Bedrock/Anthropic/etc.) back into the
+-- OpenAI chat.completion shape. We still see the original client request in
+-- access via ngx.req.get_body_data() because Kong preserves the client body
+-- buffer even when ai-proxy-advanced rewrites the upstream request via
+-- kong.service.request.set_raw_body.
 local StraikerHandler = {
-  PRIORITY = 950,
-  VERSION = "0.3.1",
+  PRIORITY = 760,
+  VERSION = "0.4.0",
 }
 
 ------------------------------------------------------------
@@ -231,6 +239,19 @@ function StraikerHandler:access(conf)
 
   ngx.req.read_body()
   local raw = ngx.req.get_body_data()
+  if not raw then
+    -- Kong buffered the body to a tempfile because it exceeded
+    -- client_body_buffer_size (default 8 KiB). Common with agent-loop
+    -- iterations where messages[] accumulates tool results. Pull it back.
+    local body_file = ngx.req.get_body_file()
+    if body_file then
+      local f = io.open(body_file, "rb")
+      if f then
+        raw = f:read("*a")
+        f:close()
+      end
+    end
+  end
   if not raw or raw == "" then return end
 
   local body = cjson.decode(raw)
@@ -320,6 +341,73 @@ function StraikerHandler:header_filter(conf)
   if conf.mode == "pre_call" then return end
   -- swallow Content-Length so the buffered body can be re-emitted unchanged
   ngx.header.content_length = nil
+  -- Remember the response Content-Type / Encoding so body_filter knows whether
+  -- to parse the buffer as a single chat.completion JSON, an SSE stream, and
+  -- whether the buffer is gzipped. ai-proxy-advanced does not honor our
+  -- access-phase Accept-Encoding: identity override and forwards OpenAI's
+  -- gzipped bytes unchanged when the upstream chose gzip — so we must inflate
+  -- before parsing.
+  local ct = ngx.header.content_type or ""
+  kong.ctx.plugin.is_sse = ct:find("text/event-stream", 1, true) ~= nil
+  local ce = ngx.header.content_encoding or ""
+  kong.ctx.plugin.is_gzip = ce:lower():find("gzip", 1, true) ~= nil
+end
+
+-- Parse a buffered SSE response from ai-proxy-advanced (or any
+-- OpenAI-compatible streaming upstream). Concatenates delta.content across
+-- all chunks and unions tool_calls indices into a flat list. Returns
+-- (assembled_text, tool_calls_or_nil).
+local function parse_sse_buffer(buf)
+  local content_parts = {}
+  local tool_call_acc = {}  -- index -> { id, function = { name, arguments } }
+  local saw_tool_calls = false
+
+  for line in buf:gmatch("[^\r\n]+") do
+    local data = line:match("^data:%s*(.+)$")
+    if data and data ~= "[DONE]" then
+      local ok, evt = pcall(cjson.decode, data)
+      if ok and type(evt) == "table" and evt.choices and evt.choices[1] then
+        local delta = evt.choices[1].delta or evt.choices[1].message
+        if delta then
+          if type(delta.content) == "string" and delta.content ~= "" then
+            table.insert(content_parts, delta.content)
+          end
+          if type(delta.tool_calls) == "table" then
+            saw_tool_calls = true
+            for _, tc in ipairs(delta.tool_calls) do
+              local idx = tc.index or (#tool_call_acc + 1)
+              local slot = tool_call_acc[idx] or { ["function"] = { arguments = "" } }
+              if tc.id then slot.id = tc.id end
+              if tc.type then slot.type = tc.type end
+              if tc["function"] then
+                if tc["function"].name then slot["function"].name = tc["function"].name end
+                if tc["function"].arguments then
+                  slot["function"].arguments = (slot["function"].arguments or "") .. tc["function"].arguments
+                end
+              end
+              tool_call_acc[idx] = slot
+            end
+          end
+        end
+      end
+    end
+  end
+
+  local tool_calls = nil
+  if saw_tool_calls then
+    tool_calls = {}
+    -- Collect indices and sort: OpenAI typically emits contiguous indices
+    -- starting at 0, but be defensive against gaps or non-zero start.
+    local indices = {}
+    for idx in pairs(tool_call_acc) do
+      indices[#indices + 1] = idx
+    end
+    table.sort(indices)
+    for _, idx in ipairs(indices) do
+      tool_calls[#tool_calls + 1] = tool_call_acc[idx]
+    end
+  end
+  return table.concat(content_parts), tool_calls
 end
 
 function StraikerHandler:body_filter(conf)
@@ -328,19 +416,70 @@ function StraikerHandler:body_filter(conf)
 
   local chunk = ngx.arg[1]
   local eof = ngx.arg[2]
-  kong.ctx.plugin.body_buf = (kong.ctx.plugin.body_buf or "") .. (chunk or "")
-
-  if eof then
-    local resp = cjson.decode(kong.ctx.plugin.body_buf)
-    local app_response = ""
-    local has_tool_calls = false
-    if resp and resp.choices and resp.choices[1] and resp.choices[1].message then
-      app_response = resp.choices[1].message.content or ""
-      has_tool_calls = resp.choices[1].message.tool_calls ~= nil
-    end
-    kong.ctx.plugin.app_response = app_response
-    kong.ctx.plugin.has_tool_calls = has_tool_calls
+  -- Accumulate chunks in a table and concat at EOF (O(n)). Repeated string
+  -- concatenation in Lua is O(n^2) and noticeable on multi-MB streams.
+  local parts = kong.ctx.plugin.body_parts
+  if not parts then
+    parts = {}
+    kong.ctx.plugin.body_parts = parts
   end
+  if chunk and chunk ~= "" then
+    parts[#parts + 1] = chunk
+  end
+
+  if not eof then return end
+
+  local raw_body = table.concat(parts)
+  -- Free the per-chunk table now that we have the assembled body.
+  kong.ctx.plugin.body_parts = nil
+
+  -- Inflate gzipped responses before parsing. Detected via header_filter.
+  -- Defensive check on magic bytes too for cases where the header was missing.
+  local looks_gzip = #raw_body >= 2 and raw_body:byte(1) == 0x1f and raw_body:byte(2) == 0x8b
+  if kong.ctx.plugin.is_gzip or looks_gzip then
+    local ok, inflated = pcall(kong_gzip.inflate_gzip, raw_body)
+    if ok and inflated and #inflated > 0 then
+      raw_body = inflated
+    else
+      ngx.log(ngx.WARN, "[straiker] gzip inflate failed, falling back to raw body")
+    end
+  end
+  kong.ctx.plugin.body_buf = raw_body
+
+  local app_response = ""
+  local has_tool_calls = false
+
+  if conf.ai_proxy_advanced_compat and kong.ctx.plugin.is_sse then
+    -- Streaming path: accumulate delta.content across SSE events.
+    local content, tool_calls = parse_sse_buffer(kong.ctx.plugin.body_buf)
+    app_response = content
+    has_tool_calls = tool_calls ~= nil
+    -- Preserve the parsed tool_calls so the agentic post-call payload includes
+    -- them in the assistant turn. Used by build_agentic_messages below.
+    kong.ctx.plugin.streamed_tool_calls = tool_calls
+  else
+    -- Single-shot JSON path (v0.3.x behavior).
+    local resp = cjson.decode(kong.ctx.plugin.body_buf)
+    if resp and resp.choices and resp.choices[1] and resp.choices[1].message then
+      local msg = resp.choices[1].message
+      -- cjson.safe decodes JSON `null` to a non-nil sentinel (cjson.null). Treat
+      -- it as missing both for content (otherwise the literal "userdata: NULL"
+      -- would leak into app_response) and for tool_calls (otherwise we'd flag
+      -- final-iteration responses with tool_calls:null as "still calling tools"
+      -- and skip post-call — silently dropping every agent-loop final turn).
+      local content = msg.content
+      if content == nil or content == cjson.null or type(content) ~= "string" then
+        app_response = ""
+      else
+        app_response = content
+      end
+      local tcs = msg.tool_calls
+      has_tool_calls = type(tcs) == "table" and #tcs > 0
+    end
+  end
+
+  kong.ctx.plugin.app_response = app_response
+  kong.ctx.plugin.has_tool_calls = has_tool_calls
 end
 
 ------------------------------------------------------------
