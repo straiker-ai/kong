@@ -51,6 +51,14 @@ return {
               type = "boolean",
               default = false,
             } },
+          { blocking = {
+              type = "boolean",
+              default = false,
+            } },
+          { verbose_block = {
+              type = "boolean",
+              default = false,
+            } },
         },
     } },
   },

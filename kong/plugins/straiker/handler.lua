@@ -11,7 +11,7 @@ local kong_gzip = require "kong.tools.gzip"
 -- kong.service.request.set_raw_body.
 local StraikerHandler = {
   PRIORITY = 760,
-  VERSION = "0.4.0",
+  VERSION = "0.5.0",
 }
 
 ------------------------------------------------------------
@@ -267,17 +267,17 @@ function StraikerHandler:access(conf)
   kong.ctx.plugin.body = body
   kong.ctx.plugin.headers = ngx.req.get_headers()
 
-  if conf.mode == "post_call" then return end
+  -- blocking=true overrides post_call-only mode: fire synchronous pre-call on
+  -- every iteration so tool-result indirect injections can be blocked at the
+  -- gateway before the upstream LLM acts on them.
+  if conf.mode == "post_call" and not conf.blocking then return end
 
-  -- Agent-loop dedupe: in agentic mode, skip pre-call only on continuation
-  -- iterations of the agent loop (last message is a tool result or an
-  -- intermediate assistant turn). Pre-call STILL fires on the first iteration
-  -- where the last message is real user input -- that's the right point to
-  -- block obviously bad prompts before the agent starts working. This keeps
-  -- gateway-level blocking working for agentic routes without producing the
-  -- empty-response duplicate turns we'd see if pre-call ran every iteration.
+  -- Agent-loop dedupe: skip pre-call on continuation iterations (tool/assistant
+  -- last message) to avoid duplicate turns. When blocking=true this skip is
+  -- disabled so every iteration — including those carrying poisoned tool results
+  -- — is scored synchronously and can be blocked with 403.
   local last_msg = body.messages and body.messages[#body.messages]
-  if conf.agentic and last_msg
+  if conf.agentic and not conf.blocking and last_msg
      and (last_msg.role == "tool" or last_msg.role == "assistant") then
     return
   end
@@ -322,13 +322,30 @@ function StraikerHandler:access(conf)
     -- phase fires a phantom post-call turn for a request that never reached
     -- the upstream model.
     kong.ctx.plugin.blocked = true
-    return kong.response.exit(403, {
-      error = {
-        message = "Straiker: threat detected (pre-call)",
-        score = score,
-        turn_id = result.turn_id or result.turnId,
-        code = "403",
-      },
+    -- verbose_block=true: return 403 (visible in API clients / Postman demos).
+    -- verbose_block=false (default): return an OpenAI-compatible 200 so the
+    -- agent loop terminates cleanly without revealing Straiker to the caller.
+    if conf.verbose_block then
+      return kong.response.exit(403, {
+        error = {
+          message = "Request blocked by policy.",
+          type    = "invalid_request_error",
+          code    = "content_policy_violation",
+        },
+      })
+    end
+    return kong.response.exit(200, {
+      id      = "chatcmpl-blocked",
+      object  = "chat.completion",
+      model   = kong.ctx.plugin.model or "unknown",
+      choices = {{
+        index         = 0,
+        message       = {
+          role    = "assistant",
+          content = "I'm sorry, I'm unable to process that request.",
+        },
+        finish_reason = "stop",
+      }},
     })
   end
 end
