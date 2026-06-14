@@ -283,6 +283,187 @@ Headers the plugin reads from the upstream client request and forwards to Straik
 | `timeout` | `5000` | Straiker call timeout in milliseconds. |
 | `fail_open` | `false` | When `true`, allow traffic through if Straiker is unreachable. |
 | `ai_proxy_advanced_compat` | `false` | Enable when the route also has `ai-proxy` / `ai-proxy-advanced` attached. Turns on the SSE-aware response accumulator so streamed `chat.completion.chunk` events are reassembled into a single `app_response` before posting to `/detect`. See §11. |
+| `app_id_header` | `"off"` | Name of a request header that already carries the app identifier (e.g. `x-app-id`). **Tier 1** of app source resolution — use when an edge/request-transformer or the calling app sets the header directly. Set to `"off"` to disable. See §10. |
+| `jwt_app_claim` | `"off"` | JWT claim to use as the per-request app source. **Tiers 2–3** of app source resolution. **This is the Microsoft Entra / Azure AD path** — pair it with Kong's `openid-connect` (or `jwt`) plugin. Values: `"auto"` (tries `app_displayname` → `azp` → `appid`; recommended), `"appid"` (Entra v1 app-only tokens), `"azp"` (Entra v2 tokens), `"off"` (disabled). See §10. |
+
+---
+
+## 10. Automatic App Source Resolution (v0.6.0+)
+
+### 10.1 The problem: one route, one key, many apps
+
+In an enterprise model gateway, a single Kong route exposes an OpenAI-compatible
+endpoint to many internal teams. Each team's app authenticates with the company
+IdP (Microsoft Entra / Azure AD, Okta, …) and forwards its token as
+`Authorization: Bearer <jwt>` on every call. Kong validates the token centrally.
+
+From the gateway's perspective every request looks identical — same route, same
+Straiker API key — so without extra configuration all traffic lands in the
+Console under one app (`source = "kong-plugin"`). That makes per-app dashboards,
+policy, and attribution impossible.
+
+The `source` field in the `/detect?agentic` payload maps to a Straiker
+application, and a new value auto-creates a new app profile. v0.6.0 derives
+`source` per request from the **verified caller identity**, so every app team
+gets its own profile automatically — one Kong route, one key, no per-app setup.
+
+### 10.2 Three ways to resolve the app identity
+
+`resolve_app_source()` tries three tiers in order; the configured `source` is
+the fallback when none resolve.
+
+| Tier | Config | Where the identity comes from | Verified by Kong? |
+|---|---|---|---|
+| **1** | `app_id_header` | A request header (e.g. `x-app-id`) set by an edge component, a `request-transformer`, or the app itself | Depends on who set it |
+| **2** | `jwt_app_claim` | The validated JWT in `kong.ctx.shared.authenticated_jwt_token`, left there by `openid-connect` or the `jwt` plugin | **Yes** — signature-checked against the IdP |
+| **3** | `jwt_app_claim` | The raw `Authorization: Bearer` token, decoded directly | No |
+
+**For Microsoft Entra / Azure AD, use Tier 2.** It is the only path that is both
+automatic (the app sends only its normal token) *and* signature-verified (Kong
+rejects forged tokens before the plugin runs). The rest of this section focuses
+on it.
+
+### 10.3 The verified Entra production pattern (Tier 2)
+
+```
+  App (Entra JWT)                 Kong Gateway                          Upstream
+  ───────────────   ┌─────────────────────────────────────────────┐
+  Authorization:    │ openid-connect  (validate vs tenant JWKS)    │
+  Bearer eyJ…  ───► │   • rejects invalid/expired → 401            │
+                    │   • stores the VERIFIED token in             │
+                    │     kong.ctx.shared.authenticated_jwt_token  │
+                    │ ai-proxy-advanced                            │
+                    │   • replaces Authorization with the provider │ ──► OpenAI/
+                    │     key (OpenAI / Bedrock / …)               │     Bedrock/…
+                    │ straiker  (PRIORITY 760)                     │
+                    │   • reads the verified token from SHARED     │
+                    │     CONTEXT — not the header                 │
+                    │   • extracts azp / appid → source            │
+                    └─────────────────────────────────────────────┘
+                                       │ source = <calling app client id>
+                                       ▼
+                           Straiker: per-app profile auto-created
+```
+
+Two facts make this work, both confirmed against a live Entra tenant:
+
+1. `openid-connect` leaves the **validated** token in
+   `kong.ctx.shared.authenticated_jwt_token`. The plugin reads it there, so it
+   never has to parse or trust a header.
+2. That shared value is **request context, not a header**, so it survives
+   `ai-proxy-advanced` replacing the `Authorization` header with the upstream
+   provider key. (Tier 3 — decoding `Authorization` directly — does **not** work
+   on `ai-proxy-advanced` routes for exactly this reason: the original token is
+   gone by the time the plugin's `access` phase runs.)
+
+**Kong `openid-connect` config (bearer validation):**
+
+```yaml
+plugins:
+  - name: openid-connect
+    config:
+      issuer: https://login.microsoftonline.com/<tenant-id>/v2.0
+      auth_methods: ["bearer"]
+      # An app registration in your tenant; used to satisfy audience validation
+      # (aud == client_id for v2 tokens).
+      client_id: ["<gateway-app-client-id>"]
+      client_secret: ["<secret>"]
+```
+
+**Straiker plugin config:**
+
+```yaml
+  - name: straiker
+    config:
+      api_key: ${STRAIKER_API_KEY}
+      agentic: true
+      jwt_app_claim: "auto"        # azp (v2) or appid (v1) — auto handles both
+      ai_proxy_advanced_compat: true
+      source: "model-gateway"      # fallback when no validated token is present
+```
+
+> No `upstream_headers` claim-to-header mapping is required. The
+> `openid-connect` claim-injection feature maps **id_token / userinfo** claims,
+> not **bearer access-token** claims, so it does *not* populate an `x-app-id`
+> header for app-only Entra tokens. Tier 2 reads the access token from shared
+> context instead — simpler, and no extra config.
+
+### 10.4 Which claim carries the app identity (real Entra tokens)
+
+A real **client-credentials (app-only)** access token — the pattern a service or
+agent uses — varies by the resource app's `requestedAccessTokenVersion`:
+
+| Token | `iss` | App-identity claim | `app_displayname` |
+|---|---|---|---|
+| **v1.0** (default for custom-API resources) | `https://sts.windows.net/<tenant>/` | **`appid`** | usually absent |
+| **v2.0** (`requestedAccessTokenVersion: 2`) | `https://login.microsoftonline.com/<tenant>/v2.0` | **`azp`** | usually absent |
+
+Both carry the **calling app registration's client ID** — the stable per-app
+identifier. Because the *default* app-only token is **v1 with `appid`** (not
+`azp`), use `jwt_app_claim: "auto"`, which resolves `app_displayname → azp →
+appid` and therefore works for either token version. Set it explicitly to
+`"appid"` or `"azp"` only if you've standardized on one version.
+
+> `aud` is the *resource* (the gateway), identical across all callers — don't
+> use it. `oid` is the service-principal object ID, which differs from the
+> client ID — avoid it.
+
+### 10.5 Alternative: Tier 1 (pre-injected header)
+
+If a component **upstream of this plugin** already places the app id in a header
+— an API-gateway edge, a `request-transformer`, or the calling app itself —
+point the plugin at it:
+
+```yaml
+  - name: straiker
+    config:
+      app_id_header: "x-app-id"   # plugin reads this header as the source
+      source: "model-gateway"
+```
+
+This is the right tool when you control header injection at the edge. It is
+**not** what Kong `openid-connect` produces for bearer tokens (see §10.3), so for
+the pure-Entra flow prefer Tier 2.
+
+### 10.6 Tier 2 also works with Kong's free `jwt` plugin
+
+The open-source `jwt` plugin (consumer-key model, HS256/RS256) populates the
+**same** `kong.ctx.shared.authenticated_jwt_token` field. So `jwt_app_claim`
+works identically behind it — useful where Entra/OIDC isn't in play but JWTs are
+still validated at the gateway.
+
+### 10.7 How Straiker app profiles are created
+
+Each distinct `source` value auto-creates a Straiker application on its first
+request and accumulates traffic under it thereafter:
+
+```
+ source = analytics-platform-client-001  ──►  App profile A  (auto-created)
+ source = support-agent-client-002        ──►  App profile B  (auto-created)
+ source = research-intel-client-003       ──►  App profile C  (auto-created)
+ source = model-gateway   (fallback)      ──►  fallback profile (no identity resolved)
+```
+
+Each profile has its own Activity feed, controls (detect/block per control),
+usage metrics, and per-user attribution.
+
+### 10.8 Verification status
+
+**Verified end-to-end against a live Microsoft Entra tenant** (`openid-connect` +
+`ai-proxy-advanced` + straiker on a single Kong route, one Straiker API key):
+
+- A real Entra app-registration token is **validated by Kong against the tenant
+  JWKS** — a forged or invalid token is rejected with **HTTP 401** before the
+  plugin runs.
+- `ai-proxy-advanced` replaces `Authorization` with the provider key (confirmed
+  by inspecting the headers visible at the plugin's `access` phase); the caller
+  identity nonetheless resolves — proving it comes from shared context (Tier 2),
+  not the header.
+- The plugin resolves `source` to the calling app's client ID and a distinct
+  Straiker app profile is auto-created — with the app sending **only its normal
+  Entra bearer token** (no `x-app-id`, no app change).
+- Multi-app enumeration (5 distinct identities → 5 distinct Console profiles)
+  verified through the single route on one key.
 
 ---
 
@@ -372,3 +553,6 @@ agent-loop iterations that stream their tool calls.
 - Detect API reference: <https://docs.straiker.ai/api-reference/defend-ai-api>
 - Detect-agentic API reference: <https://docs.straiker.ai/api-reference/defend-ai-api/detect-agentic>
 - Plugin GitHub repo & releases: <https://github.com/PhimmStraiker/kong-plugin-straiker>
+- Kong openid-connect plugin reference: <https://developer.konghq.com/plugins/openid-connect/>
+- Kong jwt plugin reference: <https://developer.konghq.com/plugins/jwt/>
+- Azure AD JWT claims reference: <https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference>

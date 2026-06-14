@@ -26,7 +26,7 @@ docker run -d --name "$NAME" \
   -e "KONG_PLUGINS=bundled,straiker" \
   -p 8000:8000 \
   -p 8443:8443 \
-  straiker-konnect-dp:0.4.0
+  straiker-konnect-dp:0.6.0
 
 echo "Container started. Tailing logs..."
 docker logs -f "$NAME"

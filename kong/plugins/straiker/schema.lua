@@ -59,6 +59,40 @@ return {
               type = "boolean",
               default = false,
             } },
+          { app_id_header = {
+              -- Tier 1. Request header name that already carries the app id
+              -- (e.g. "x-app-id"). Highest-priority source. Use when an upstream
+              -- edge component, a request-transformer, or the calling app sets
+              -- the header directly.
+              -- NOTE: Kong openid-connect's claim-to-header injection maps
+              -- id_token / userinfo claims, NOT bearer access-token claims, so it
+              -- does not populate this for app-only Entra tokens — use
+              -- jwt_app_claim (Tier 2) for the Entra/Azure AD flow.
+              -- "off" = disabled (default).
+              type = "string",
+              default = "off",
+            } },
+          { jwt_app_claim = {
+              -- Tiers 2-3. JWT claim to use as the per-request source. This is the
+              -- Microsoft Entra / Azure AD path; pair with Kong's openid-connect
+              -- (or jwt) plugin.
+              -- "auto"  → tries app_displayname → azp (Entra v2) → appid (Entra v1)
+              --           Recommended: real app-only (client-credentials) tokens
+              --           default to v1 and carry `appid`, not `azp`.
+              -- "azp"   → Entra v2 authorized-party / app registration client ID
+              -- "appid" → Entra v1 app registration client ID
+              -- "off"   → disabled; use configured source as-is (default)
+              -- Where the verified JWT comes from:
+              --   1. kong.ctx.shared.authenticated_jwt_token — set by the
+              --      openid-connect plugin (Entra, validated vs tenant JWKS) OR
+              --      the free jwt plugin. Survives ai-proxy-advanced replacing
+              --      the Authorization header (it is request context). PREFERRED.
+              --   2. Authorization: Bearer header (direct decode) — fallback for
+              --      routes with no auth plugin; NOT available once ai-proxy /
+              --      ai-proxy-advanced has replaced the header.
+              type = "string",
+              default = "off",
+            } },
         },
     } },
   },

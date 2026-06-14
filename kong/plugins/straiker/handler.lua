@@ -11,7 +11,7 @@ local kong_gzip = require "kong.tools.gzip"
 -- kong.service.request.set_raw_body.
 local StraikerHandler = {
   PRIORITY = 760,
-  VERSION = "0.5.0",
+  VERSION = "0.6.0",
 }
 
 ------------------------------------------------------------
@@ -137,11 +137,87 @@ local function client_metadata(headers, body)
   }
 end
 
+-- resolve_app_source: three-tier lookup for the per-request app identifier.
+--
+-- Tier 1 — app_id_header:
+--   Read a pre-injected request header (e.g. "x-app-id"). Use when something
+--   upstream of this plugin places the app id in a header: a request-transformer,
+--   an API-gateway edge, or the calling app itself. (Note: Kong openid-connect's
+--   claim-to-header injection maps id_token / userinfo claims, not bearer
+--   access-token claims, so it does NOT populate this for app-only Entra tokens
+--   — Tier 2 is the path for that case.)
+--
+-- Tier 2 — jwt_app_claim via kong.ctx.shared.authenticated_jwt_token:
+--   The Kong auth plugin that validated the request leaves the verified raw JWT
+--   here. Both the Enterprise openid-connect plugin (validates Entra tokens
+--   against the tenant JWKS) and the free jwt plugin populate this field.
+--   We base64url-decode the payload and extract the named claim. This is the
+--   production path for Microsoft Entra / Azure AD: it is signature-verified by
+--   Kong and survives ai-proxy-advanced replacing the Authorization header,
+--   because it is request context rather than a header. EMPIRICALLY VERIFIED
+--   against a real Entra tenant with openid-connect + ai-proxy-advanced.
+--
+-- Tier 3 — jwt_app_claim via Authorization header (fallback):
+--   Read Authorization: Bearer <token> directly and decode the payload.
+--   Works when no validating auth plugin is in the chain (local/dev setups).
+--   Will NOT see the token on ai-proxy-advanced routes (the proxy replaces the
+--   Authorization header before this plugin's access phase) — use Tier 2 there.
+--
+local function resolve_app_source(conf, headers)
+  -- Tier 1: pre-injected header (OIDC upstream_headers pattern).
+  if conf.app_id_header and conf.app_id_header ~= "" and conf.app_id_header ~= "off" then
+    local hval = headers and (headers[conf.app_id_header] or headers[conf.app_id_header:lower()])
+    if type(hval) == "string" and hval ~= "" then
+      return hval
+    end
+  end
+
+  -- Tiers 2+3 require jwt_app_claim to be enabled.
+  if not conf.jwt_app_claim or conf.jwt_app_claim == "" or conf.jwt_app_claim == "off" then
+    return nil
+  end
+
+  -- Get raw JWT — prefer kong.ctx.shared (set by Kong's free jwt plugin),
+  -- fall back to reading the Authorization header directly.
+  local raw_token = kong.ctx.shared and kong.ctx.shared.authenticated_jwt_token
+  if not raw_token then
+    local auth = headers and (headers["authorization"] or headers["Authorization"])
+    if auth then raw_token = auth:match("^[Bb]earer%s+(.+)$") end
+  end
+  if not raw_token then return nil end
+
+  -- JWT = <header>.<payload>.<signature> — extract the middle segment.
+  local payload_b64 = raw_token:match("^[^%.]+%.([^%.]+)%.")
+  if not payload_b64 then return nil end
+
+  -- base64url → standard base64 (- → +, _ → /) then re-pad and decode.
+  local padded = payload_b64:gsub("%-", "+"):gsub("_", "/")
+  padded = padded .. string.rep("=", (4 - (#padded % 4)) % 4)
+  local json_str = ngx.decode_base64(padded)
+  if not json_str then return nil end
+
+  local ok, claims = pcall(cjson.decode, json_str)
+  if not ok or type(claims) ~= "table" then return nil end
+
+  -- "auto": prefer human-readable display name → azp (Entra v2) → appid (Entra v1).
+  -- app_displayname is an optional Entra claim; azp/appid are always present.
+  if conf.jwt_app_claim == "auto" then
+    local val = claims.app_displayname or claims.azp or claims.appid
+    return type(val) == "string" and val ~= "" and val or nil
+  end
+  local val = claims[conf.jwt_app_claim]
+  return type(val) == "string" and val ~= "" and val or nil
+end
+
 local function build_payload(opts)
-  -- opts: { conf, prompt, app_response, model, headers, body, messages }
+  -- opts: { conf, prompt, app_response, model, headers, body, messages, dynamic_source }
   local meta = client_metadata(opts.headers, opts.body)
   local trace_id   = opts.headers["x-trace-id"]
   local agent_role = opts.headers["x-agent-role"]
+  -- dynamic_source overrides conf.source when a JWT claim was successfully
+  -- extracted (e.g. Entra azp/appid) — enables auto-enumeration of multiple
+  -- apps sharing a single Straiker key on one Kong gateway.
+  local effective_source = opts.dynamic_source or opts.conf.source
   -- /detect?agentic schema: identity travels in a metadata{} envelope. Field
   -- names match the working /detect payload Argus expects (user_name,
   -- session_id, user_role, remote_ip). trace_id and agent_role ride along so
@@ -151,14 +227,14 @@ local function build_payload(opts)
     user_name  = meta.user_name,
     user_role  = meta.user_role,
     remote_ip  = ngx.var.remote_addr,
-    app_name   = opts.conf.source,
+    app_name   = effective_source,
     source     = "kong-plugin",
     trace_id   = trace_id,
     agent_role = agent_role,
   }
   if opts.conf.agentic then
     return {
-      source = opts.conf.source,
+      source = effective_source,
       destination = opts.conf.destination,
       messages = build_agentic_messages(opts.messages, opts.app_response),
       session_id = meta.session_id,
@@ -267,6 +343,18 @@ function StraikerHandler:access(conf)
   kong.ctx.plugin.body = body
   kong.ctx.plugin.headers = ngx.req.get_headers()
 
+  -- Per-request app source resolution (see resolve_app_source). On an Entra +
+  -- openid-connect deployment this resolves via Tier 2: the OIDC plugin
+  -- validates the bearer token against the tenant JWKS and leaves the verified
+  -- token in kong.ctx.shared.authenticated_jwt_token, which survives
+  -- ai-proxy-advanced replacing the Authorization header (it is request context,
+  -- not a header). We decode it and extract the configured claim.
+  local dynamic_source = resolve_app_source(conf, kong.ctx.plugin.headers)
+  if dynamic_source then
+    kong.ctx.plugin.dynamic_source = dynamic_source
+    kong.log.notice("[straiker] app source resolved: ", dynamic_source)
+  end
+
   -- blocking=true overrides post_call-only mode: fire synchronous pre-call on
   -- every iteration so tool-result indirect injections can be blocked at the
   -- gateway before the upstream LLM acts on them.
@@ -291,6 +379,7 @@ function StraikerHandler:access(conf)
     body = body,
     messages = body.messages,
     hook = "pre_call",
+    dynamic_source = kong.ctx.plugin.dynamic_source,
   })
 
   local res, err = call_straiker(conf, payload)
@@ -530,6 +619,7 @@ function StraikerHandler:log(conf)
     body = kong.ctx.plugin.body,
     messages = kong.ctx.plugin.messages,
     hook = "post_call",
+    dynamic_source = kong.ctx.plugin.dynamic_source,
   })
 
   -- defer into a fresh ngx.timer so cosockets are allowed
