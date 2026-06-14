@@ -25,7 +25,7 @@ Kong separates **what the plugin is** from **where it runs**:
 Recommended install (one command, any Kong instance OSS/Enterprise/Konnect data plane):
 
 ```bash
-luarocks install https://github.com/PhimmStraiker/kong-plugin-straiker/releases/download/v0.4.0/kong-plugin-straiker-0.4.0-1.all.rock
+luarocks install https://github.com/PhimmStraiker/kong-plugin-straiker/releases/download/v0.7.0/kong-plugin-straiker-0.7.0-1.all.rock
 export KONG_PLUGINS=bundled,straiker     # or in kong.conf
 kong reload
 ```
@@ -77,7 +77,7 @@ Two important notes:
 | Benign prompt, all controls in detect | ✅ score=0 | ✅ score=0 | 200 | **2** (1 pre + 1 post) | Pre-call: prompt, no badges. Post-call: prompt + assistant response, no badges. |
 | Benign prompt, controls in block | ✅ score=0 | ✅ score=0 | 200 | **2** (1 pre + 1 post) | Same as above. Block mode only fires on flagged content; benign content isn't blocked. |
 | Adversarial prompt, control in **detect** mode | ✅ score=1 | ✅ score=1 | 200 | **2** (1 pre + 1 post) | Pre-call: prompt with red violation badge (e.g. "LLM Evasion"). Post-call: prompt + response with same badge. Model still answered. |
-| Adversarial prompt, control in **block** mode | ✅ score=1, blocks | ❌ skipped (request never reached upstream) | **403** | **1** (1 pre, 0 post) | Pre-call turn with prompt + empty response box. Should display block indicator (Eng item — see §6). Body of 403 returned to client carries `turn_id`, `score`, message. |
+| Adversarial prompt, control in **block** mode | ✅ score=1, blocks | ❌ skipped (request never reached upstream) | **403** | **1** (1 pre, 0 post) | Pre-call turn with prompt + empty response box. Body of 403 returned to client carries `turn_id`, `score`, message. |
 
 ### 4.2 Agentic route (`agentic: true`) — single-iteration call (no tools)
 
@@ -181,68 +181,17 @@ OpenAI's native tool_calls format (`{id, type, function:{name, arguments:"<json>
 
 ---
 
-## 6. Open issues for Eng (verified against production app 1614)
+## 6. Deployment recommendations
 
-These are observations from a 152-turn data export from app 1614 (CSV from `/applications/defend/1614/activity` → Download Prompts). Plugin behavior is correct; the gaps below are on the Straiker side.
-
-### 6.0 `LLM Evasion` (prompt-injection control) over-fires on agentic apps in block mode
-
-**Symptom:** Putting the **LLM Evasion** control in `block` mode on an agentic-type Straiker application produces frequent false positives on benign content. Verified examples that returned `score: 1` from the agentic API with `block.llm_evasion: 1`:
-
-- `"What is 17 times 19 plus 23?"` (math)
-- `"How do you say hello in Spanish?"` (translation)
-- `"hello"` (one-word greeting)
-
-**Plugin-side behavior is correct:** when Argus returns `score: 1`, the plugin honors it and returns HTTP 403 — verified across 5/5 round-trip tests. **The issue is detection-side**, not gateway-side. Detect mode returns the same violations but does not block, so the FP rate is invisible until block mode is enabled.
-
-**Recommendation for new agentic deployments:**
-
-1. Start with **all controls in detect mode** for the first week of monitoring. Inspect Activity for violation patterns and tune sensitivity per control.
-2. Only flip a control to **block mode** after you've reviewed its detect-mode firings on real traffic and confirmed the FP rate is acceptable for that specific app.
-3. **Be especially cautious with LLM Evasion in block mode on agentic apps.** It's the single biggest FP risk and will block normal user questions like "what's the weather" or "how do I do X". If you must enable it in block mode, raise the threshold or scope it to a narrow subset of routes first.
-4. Customer-facing UX impact of an over-firing control in block mode is severe — every blocked request returns HTTP 403 to the end user with no model response. Validate carefully before enabling.
-
-This is an Eng / detection-tuning concern. The plugin and its Argus integration are working as designed; tuning belongs to the Detection / Models team.
-
-### 6.1 `user_name` is dropped on the agentic ingest path
-
-**Symptom:** Every persisted turn record on `/detect?agentic` has `user_name = "user"` literal, regardless of what the plugin sent in `metadata.user_name` or top-level `user_name`. Confirmed across 152 turns: **152/152 have `user_name = "user"`**, despite payloads carrying `alice@acme.com`, `dan@acme.com`, `clean-user-1778176029@acme.com`, etc.
-
-**Plugin-side proof:** plugin debug logs show outgoing payloads with the correct identity. Direct API probes (no Kong, no plugin) bypassing the gateway also persist as `user_name = "user"` — so this is purely an agentic ingest issue, not a plugin issue. Standard `/detect` (non-agentic) preserves `user_name` correctly.
-
-**Impact:** No per-user attribution on agentic turns. UBA, forensics, per-user policy all useless on agentic apps until fixed.
-
-**Test turn IDs to investigate:**
-- `pf-a3fa5802-d8e7-4e86-9489-19608ab35e86` — sent `metadata.user_name: "schema-verify-zachary@acme.com"`
-- `pf-e2df3162-3c61-4f71-9446-202b170c0e3a` — sent top-level `user_name: "schema-verify-yoshi@acme.com"`
-
-### 6.2 Block-mode triggers don't render distinctly in Console Activity
-
-**Symptom:** When a control is in `block` mode and fires, the gateway correctly returns HTTP 403 with `score: 1` in the API response. The persisted Turn record exists with the right prompt and metadata. **But the Activity row shows no visual distinction from a benign turn** — no "blocked" badge, no red label, no shield icon. The empty assistant-response box is the only hint.
-
-In contrast, `detect`-mode triggers correctly render their violation badge (e.g. "LLM Evasion" in red) on the Activity row.
-
-**Impact:** Security teams reviewing Activity can't distinguish a block from a hung benign request. Demo confusion (the customer's first reaction was "did the model not answer?").
-
-**Ask:** Add a `[BLOCKED]` chip or red border to Activity rows where the API call to `/detect?agentic` resulted in `score_block > 0`, separate from in-detect-mode tag rendering.
-
-### 6.3 Block-mode trigger details may not be persisted into the Turn verdict
-
-**Symptom (needs Eng confirmation, not certain):** Looking at the debug panel of a turn that we *know* was blocked at the gateway (HTTP 403, plugin received `score: 1` from the API), the persisted Turn shows `score: 0`, `score_block: 0`, `verdict.detections: []`. The block decision came back to the plugin instantly but doesn't seem reflected in the indexed record.
-
-**Caveat:** `phimm@straiker.ai` (the user) reasonably pushed back on this, saying architecturally Argus should record what it returned. So it's possible the Console UI reads from a partial projection that doesn't include block-mode results, while the underlying record is correct. **Eng to confirm whether the indexed Turn does or doesn't reflect block-mode triggers**, and if not, fix or document the projection mismatch.
-
-The `/api/v1/score?turn_id=…` lookup endpoint returns 404 for `pf-`-prefixed agentic turn IDs (it expects UUID4), so this can't be independently verified outside the Console UI today. Adding agentic-ID support to the score endpoint would help.
-
-### 6.4 Multi-turn sessions need explicit `x-session-id` from the client
-
-**Symptom:** All 152 turns in the export had distinct `session_id` values. None grouped into multi-turn sessions even though some were multi-iteration agent loops or multi-prompt conversations.
-
-**Cause:** The plugin's `session_id` resolution is `x-session-id header → ngx.var.request_id → "kong-session"`. `ngx.var.request_id` is per-Kong-request, not per-conversation, so without an explicit header the plugin reports each request as a fresh session.
-
-**Customer guidance (already in the plugin docs):** Have the calling app always set `x-session-id` to a stable value for one logical conversation. The doc tells them to do this, but it's worth flagging as a real-world gotcha — if they don't, they lose multi-turn correlation in the Console.
-
----
+- **Start in detect mode.** Bring controls up in `detect` first and review the
+  Activity feed before switching any control to `block`. Block mode returns
+  HTTP 403 to the end user, so validate the false-positive rate on real traffic
+  per control before enabling it — prompt-injection controls in particular can
+  over-fire on benign questions.
+- **Set a stable `x-session-id`.** The plugin derives the session from the
+  `x-session-id` header, falling back to the per-request Kong request id. Have
+  the calling app set a stable `x-session-id` for one logical conversation so
+  multi-turn and multi-iteration interactions group correctly in the Console.
 
 ## 7. Identity, session, and trace correlation (operator reference)
 
@@ -544,11 +493,53 @@ agent-loop iterations that stream their tool calls.
 
 ---
 
+## 11b. MCP discovery (Preview — v0.7.0+)
+
+> **Preview.** Gated behind `mcp_discovery` (default `false`). Requires Straiker
+> backend support for the configured `mcp_source` value.
+
+When a Kong route fronts a **network-hosted MCP server** (Streamable HTTP / SSE),
+Kong proxies the raw JSON-RPC, so the gateway sees the full MCP protocol —
+including `tools/call` and the server identity (the route's upstream). With
+`mcp_discovery: true`, the plugin emits a `beforeMCPExecution` event to the
+Straiker detect endpoint for each distinct `tools/call`, so the MCP server is
+inventoried in the Console's **Discovered MCP Servers**.
+
+```
+   client ──HTTP JSON-RPC──> Kong route ──> MCP server (upstream)
+                                │
+        straiker plugin (mcp_discovery=true), access phase:
+          • parse JSON-RPC (single or batch)
+          • for each tools/call: derive server name + URL from the Kong upstream
+          • dedup per (server, tool); POST a beforeMCPExecution event to /detect
+```
+
+This applies only to MCP traffic that **transits the gateway**. MCP servers an
+agent calls directly (e.g. local stdio servers) are not visible to Kong.
+
+### Config
+
+```yaml
+plugins:
+  - name: straiker
+    config:
+      api_key: "<your-key>"
+      mcp_discovery: true
+      # mcp_server_name: "my-mcp-server"   # optional; defaults to the upstream host
+      # mcp_source: "kong"                  # x-tool label sent with the event
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `mcp_discovery` | `false` | Emit MCP discovery events for `tools/call` on this route. |
+| `mcp_server_name` | `off` | Override the discovered server name. When `off`, derived from the Kong upstream host. |
+| `mcp_source` | `kong` | `x-tool` label sent with the event. Requires backend support for the value. |
+
+---
+
 ## 12. References
 
 - Plugin source: [`kong/plugins/straiker/handler.lua`](kong/plugins/straiker/handler.lua), [`schema.lua`](kong/plugins/straiker/schema.lua)
-- Multi-agent demo client: [`multi_agent_trace.py`](multi_agent_trace.py)
-- Single-agent test client: [`agentic_test.py`](agentic_test.py)
 - Public docs: <https://docs.straiker.ai/defend-ai/kong-gateway-integration>
 - Detect API reference: <https://docs.straiker.ai/api-reference/defend-ai-api>
 - Detect-agentic API reference: <https://docs.straiker.ai/api-reference/defend-ai-api/detect-agentic>

@@ -9,13 +9,9 @@ __pycache__/
 *.all.rock
 *.rock
 
-# Local-only test harnesses and provisioning scripts.
-# These hardcode a real Straiker API key and/or environment-specific identifiers
-# (tenant IDs, app registration IDs) or reference a specific customer, and must
-# never be committed to the public repo.
-scripts/*iqvia*
-scripts/*IQVIA*
-scripts/konnect_setup_jwt_test.py
-scripts/konnect_setup_simulation.py
-scripts/konnect_setup_oidc_real.py
-scripts/simulate_multi_app.py
+# Local-only provisioning/test scripts (never committed; may hold keys or
+# environment-specific identifiers).
+scripts/
+
+# Internal planning doc — never public
+MCP_DISCOVERY_PLAN.md

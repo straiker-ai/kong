@@ -93,6 +93,32 @@ return {
               type = "string",
               default = "off",
             } },
+          { mcp_discovery = {
+              -- Enable on a route that fronts a network-hosted MCP server
+              -- (Streamable HTTP / SSE). The plugin parses the JSON-RPC body and
+              -- emits a `beforeMCPExecution` event per distinct tools/call to the
+              -- Straiker coding-agent ingest, so the server is inventoried in the
+              -- Console's Discovered MCP Servers. Server identity (name + URL) is
+              -- derived from the Kong upstream; tool name from JSON-RPC params.name.
+              -- Emits are deduped per (server, tool). Default off.
+              type = "boolean",
+              default = false,
+            } },
+          { mcp_server_name = {
+              -- Optional override for the discovered server name. When "off",
+              -- the name is derived from the Kong upstream service (its host —
+              -- the MCP server FQDN — or service name).
+              type = "string",
+              default = "off",
+            } },
+          { mcp_source = {
+              -- The `x-tool` label sent with MCP-discovery events. The Straiker
+              -- detect endpoint routes the event through the agent-event ingest
+              -- based on this value. Default "kong"; requires backend support for
+              -- the configured source value.
+              type = "string",
+              default = "kong",
+            } },
         },
     } },
   },

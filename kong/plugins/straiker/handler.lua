@@ -11,7 +11,7 @@ local kong_gzip = require "kong.tools.gzip"
 -- kong.service.request.set_raw_body.
 local StraikerHandler = {
   PRIORITY = 760,
-  VERSION = "0.6.0",
+  VERSION = "0.7.0",
 }
 
 ------------------------------------------------------------
@@ -219,7 +219,7 @@ local function build_payload(opts)
   -- apps sharing a single Straiker key on one Kong gateway.
   local effective_source = opts.dynamic_source or opts.conf.source
   -- /detect?agentic schema: identity travels in a metadata{} envelope. Field
-  -- names match the working /detect payload Argus expects (user_name,
+  -- names match the /detect payload the Straiker API expects (user_name,
   -- session_id, user_role, remote_ip). trace_id and agent_role ride along so
   -- a multi-agent / multi-model interaction can be stitched into one trace.
   local metadata = {
@@ -302,6 +302,120 @@ local function call_straiker(conf, payload)
 end
 
 ------------------------------------------------------------
+-- MCP discovery from gateway-routed MCP traffic (mcp_discovery=true)
+--
+-- When a Kong route fronts a network-hosted MCP server (Streamable HTTP / SSE),
+-- Kong proxies the raw JSON-RPC, so the gateway sees the full MCP protocol: the
+-- server identity is the route's upstream and tools/call is on the wire. We
+-- forward each distinct tool invocation to the Straiker detect endpoint as a
+-- `beforeMCPExecution` agent event so the MCP server is inventoried in the
+-- Console's Discovered MCP Servers.
+--
+-- Emitted JSON payload:
+--   hook_event_name : "beforeMCPExecution"
+--   tool_name       : the MCP tool being called (JSON-RPC params.name)
+--   mcp_server_name : server identity (upstream host, or mcp_server_name override)
+--   mcp_url         : server base URL / FQDN (derived from the Kong upstream)
+--   command         : server name
+--   user_name       : app identity (config source)
+--   session_id      : stable per-server identifier
+-- The request carries `x-tool: <mcp_source>` (default "kong") so the detect
+-- endpoint routes it through the agent-event ingest. Requires Straiker backend
+-- support for the configured source value.
+------------------------------------------------------------
+
+-- Best-effort per-worker dedup so a busy MCP route emits one event per
+-- (server, tool) per TTL instead of on every call. Bounded to cap memory; a
+-- production build can swap this for a Kong shared dict.
+local _mcp_seen = {}
+local _MCP_DEDUP_TTL = 300
+
+local function mcp_should_emit(key)
+  local now = ngx.now()
+  local exp = _mcp_seen[key]
+  if exp and exp > now then
+    return false
+  end
+  if not exp then
+    local n = 0
+    for _ in pairs(_mcp_seen) do n = n + 1 end
+    if n > 1000 then _mcp_seen = {} end
+  end
+  _mcp_seen[key] = now + _MCP_DEDUP_TTL
+  return true
+end
+
+-- Derive the MCP server's name and base URL from the Kong upstream service.
+-- The upstream host IS the server's FQDN; config.mcp_server_name overrides the
+-- name when the upstream host isn't the friendly identity you want shown.
+local function mcp_server_identity(conf)
+  local svc = kong.router.get_service()
+  local host = (svc and svc.host) or "unknown-mcp"
+  local proto = (svc and svc.protocol) or "http"
+  local port = svc and svc.port
+  local mcp_url = proto .. "://" .. host .. (port and (":" .. port) or "")
+  local name = (conf.mcp_server_name and conf.mcp_server_name ~= ""
+                and conf.mcp_server_name ~= "off") and conf.mcp_server_name
+               or (svc and svc.name) or host
+  return name, mcp_url
+end
+
+local function emit_mcp_discovery(conf, raw)
+  local ok, rpc = pcall(cjson.decode, raw)
+  if not ok or type(rpc) ~= "table" then return end
+  -- JSON-RPC may be a single object or a batch array.
+  local calls = rpc.method and { rpc } or rpc
+  if type(calls) ~= "table" then return end
+
+  local server_name, mcp_url = mcp_server_identity(conf)
+  local source = (conf.mcp_source and conf.mcp_source ~= "" and conf.mcp_source ~= "off")
+                 and conf.mcp_source or "kong"
+  local app = kong.ctx.plugin.dynamic_source or conf.source or "kong-gateway"
+  local detect = (conf.detect_url or "https://api.prod.straiker.ai/api/v1/detect"):gsub("%?.*$", "")
+  local api_key = conf.api_key
+
+  for _, call in ipairs(calls) do
+    if type(call) == "table" and call.method == "tools/call"
+       and type(call.params) == "table" and type(call.params.name) == "string" then
+      local tool = call.params.name
+      if mcp_should_emit(server_name .. "|" .. tool) then
+        local event = cjson.encode({
+          hook_event_name = "beforeMCPExecution",
+          tool_name       = tool,
+          mcp_server_name = server_name,
+          mcp_url         = mcp_url,
+          command         = server_name,
+          user_name       = app,
+          session_id      = "kong-mcp-" .. server_name,
+        })
+        ngx.timer.at(0, function(premature)
+          if premature then return end
+          local httpc = http.new()
+          httpc:set_timeout(conf.timeout or 5000)
+          local res, err = httpc:request_uri(detect, {
+            method = "POST", body = event,
+            ssl_verify = true,   -- verify Straiker's TLS cert, same as call_straiker
+            keepalive_timeout = 60000,
+            keepalive_pool = 10,
+            headers = {
+              ["Content-Type"]  = "application/json",
+              ["Authorization"] = "Bearer " .. api_key,
+              ["x-tool"]        = source,
+            },
+          })
+          if not res then
+            kong.log.err("[straiker] mcp-discovery emit failed: ", err)
+          else
+            kong.log.notice("[straiker] mcp-discovery emit: server=", server_name,
+              " tool=", tool, " source=", source, " http=", res.status)
+          end
+        end)
+      end
+    end
+  end
+end
+
+------------------------------------------------------------
 -- access (pre-call): block before reaching upstream
 ------------------------------------------------------------
 
@@ -329,6 +443,13 @@ function StraikerHandler:access(conf)
     end
   end
   if not raw or raw == "" then return end
+
+  -- MCP-discovery routes carry JSON-RPC, not OpenAI chat. Emit discovery
+  -- event(s) for any tools/call and skip the OpenAI detection path entirely.
+  if conf.mcp_discovery then
+    emit_mcp_discovery(conf, raw)
+    return
+  end
 
   local body = cjson.decode(raw)
   if not body then return end
