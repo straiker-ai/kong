@@ -11,7 +11,7 @@ local kong_gzip = require "kong.tools.gzip"
 -- kong.service.request.set_raw_body.
 local StraikerHandler = {
   PRIORITY = 760,
-  VERSION = "0.7.0",
+  VERSION = "0.8.0",
 }
 
 ------------------------------------------------------------
