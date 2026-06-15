@@ -1,11 +1,22 @@
 # Straiker Kong Plugin — Design, Flow Matrix & Operations
 
-A Lua plugin that runs inside Kong Gateway and calls Straiker
-`POST /api/v1/detect` (or `/api/v1/detect?agentic`) on every AI request flowing
-through Kong. Intended as the production protection point in front of OpenAI,
-Anthropic, Bedrock, etc.
+Kong Gateway plugins that call Straiker `POST /api/v1/detect` (or
+`/api/v1/detect?agentic`) on every AI request flowing through Kong. Intended as
+the production protection point in front of OpenAI, Anthropic, Bedrock, etc.
 
-This document is the source of truth on how the plugin behaves. Read sections
+The repo ships **two builds of the same capability**, one per deployment topology:
+
+| Plugin | For | How post-call works |
+|---|---|---|
+| **`straiker`** | Self-hosted Kong (OSS/Enterprise) and Konnect **hybrid** (self-managed data plane) | Timer-based, fire-and-forget — streaming-friendly, full feature set |
+| **`straiker-saas`** | Konnect **full-SaaS Dedicated Cloud Gateways** | Buffered `response` phase (no timers — the Dedicated Cloud sandbox forbids them); synchronous response eval **and** response blocking. Buffers the answer, so token streaming is unsupported on this build |
+
+**Which one do I use?** See **§12 Deployment patterns & support matrix**. The
+`straiker-saas` build is documented in **§13**. Sections 1–11 describe the
+`straiker` plugin; almost everything (config, the flow matrix, app-source
+resolution) applies to both — §13 covers only the differences.
+
+This document is the source of truth on how the plugins behave. Read sections
 1–3 to understand the architecture; section 4 is the **flow matrix** that
 explains exactly what shows up in the Straiker Console for every combination
 of route type (chatbot vs agentic), control mode (detect vs block), and
@@ -22,13 +33,21 @@ Kong separates **what the plugin is** from **where it runs**:
 | Plugin install (the code) | LuaRocks artifact installed into Kong's standard plugin path | Once per Kong instance |
 | Plugin **attachment** (the config) | `kong.yml` services/routes block, or Admin API | Per route — each attachment gets its own `config: { ... }` |
 
-Recommended install (one command, any Kong instance OSS/Enterprise/Konnect data plane):
+Recommended install for **self-hosted Kong** and **Konnect hybrid (self-managed
+data plane)** — one command installs both plugins; enable whichever the topology
+needs via `KONG_PLUGINS`:
 
 ```bash
-luarocks install https://github.com/PhimmStraiker/kong-plugin-straiker/releases/download/v0.7.0/kong-plugin-straiker-0.7.0-1.all.rock
-export KONG_PLUGINS=bundled,straiker     # or in kong.conf
+luarocks install https://github.com/PhimmStraiker/kong-plugin-straiker/releases/download/v0.8.0/kong-plugin-straiker-0.8.0-1.all.rock
+export KONG_PLUGINS=bundled,straiker          # self-hosted / hybrid (timer build)
+# export KONG_PLUGINS=bundled,straiker-saas   # response-phase build (also fine here)
 kong reload
 ```
+
+> **Konnect full-SaaS (Dedicated Cloud Gateways)** doesn't use this rock — you
+> can't `luarocks install` on a Kong-managed data plane. Instead upload the two
+> `straiker-saas` files via the Konnect UI/API. See **§13** (topologies) and
+> **§14** (the `straiker-saas` build + upload steps).
 
 The `agentic` flag, the API key, the threshold, the mode — all of it lives on
 the attachment. One Kong install can attach the plugin to a chatbot route with
@@ -493,9 +512,188 @@ agent-loop iterations that stream their tool calls.
 
 ---
 
-## 12. References
+## 12. Deployment patterns & support matrix
+
+Kong runs in four topologies. They differ in **who hosts the data plane** (where
+the plugin code executes) and **whether custom plugins are allowed there** — which
+determines which Straiker plugin you use.
+
+| Topology | Data plane host | Custom plugins? | Straiker plugin | Streaming to client | Support |
+|---|---|---|---|---|---|
+| **Self-hosted Kong** (OSS / Enterprise, on-prem or your cloud) | You | Yes (LuaRocks / Docker image / `KONG_PLUGINS`) | **`straiker`** | ✅ Yes | ✅ Full |
+| **Konnect + self-managed DP** (hybrid) | You (DP) / Kong (control plane) | Yes (bake into the DP image + register schema on the CP) | **`straiker`** | ✅ Yes | ✅ Full |
+| **Konnect Dedicated Cloud Gateways** (full SaaS, prod) | Kong | Yes, **sandboxed** (2 files, no timers, no filesystem) | **`straiker-saas`** | ⚠️ Buffered (no token streaming) | ✅ Full parity for non-streaming |
+| **Konnect Serverless Gateways** (full SaaS, dev/free) | Kong | **No** (only bundled plugins) | — | — | ❌ Not supported (custom plugins not allowed) |
+
+**Decision rule:**
+
+- **You manage the data plane** (self-hosted or hybrid) → use **`straiker`**. It's
+  the full-feature, streaming-friendly, timer-based build.
+- **Kong manages the data plane** (Dedicated Cloud) → use **`straiker-saas`**. It's
+  the timer-free, two-file, response-phase build (§13). Streaming is buffered.
+- **Serverless Gateways** can't run custom plugins at all — there's no path; move
+  the route to a Dedicated Cloud or hybrid gateway.
+
+### 12.1 Self-hosted install
+
+```bash
+luarocks install .../kong-plugin-straiker-0.8.0-1.all.rock   # or bake into your Kong Docker image
+export KONG_PLUGINS=bundled,straiker
+kong reload
+```
+
+### 12.2 Konnect hybrid (self-managed data plane)
+
+Two halves: the **data plane** needs the plugin code; the **control plane** needs
+the schema so it can validate the plugin config you create.
+
+1. **Bake the plugin into your DP image** (it's a Kong-managed binary you run):
+   ```dockerfile
+   FROM kong/kong-gateway:3.x
+   USER root
+   COPY kong/plugins/straiker /usr/local/share/lua/5.1/kong/plugins/straiker
+   USER kong
+   ```
+   Run the DP with `KONG_PLUGINS=bundled,straiker`.
+2. **Register the plugin schema on the control plane** so Konnect accepts the
+   config (the DP does not auto-advertise custom schemas to Konnect):
+   ```bash
+   curl -X POST "$KONNECT_ADMIN_API/core-entities/plugin-schemas" \
+     -H "Authorization: Bearer $KONNECT_PAT" -H "Content-Type: application/json" \
+     -d "{\"lua_schema\": $(jq -Rs . < kong/plugins/straiker/schema.lua)}"
+   ```
+3. Create routes/services and attach the `straiker` plugin via the Konnect Admin
+   API (or the UI) as usual.
+
+### 12.3 Konnect Dedicated Cloud (full SaaS)
+
+Kong runs the data plane, so you can't install a rock or bake an image — you
+**upload the two `straiker-saas` files**. See **§13**.
+
+---
+
+## 13. straiker-saas — the Konnect Dedicated Cloud (full SaaS) build
+
+`straiker-saas` is the same guardrail capability rebuilt for Kong's **full-SaaS
+Dedicated Cloud Gateways**, where Kong hosts the data plane and runs custom
+plugins in a sandbox.
+
+### 13.1 Why it's a separate plugin
+
+1. **The Dedicated Cloud sandbox forbids background timers** (`ngx.timer.at`) and
+   `init_worker`. The `straiker` plugin does its post-call detection in a
+   log-phase timer (fire-and-forget) — not allowed there.
+2. **A Kong plugin can't implement both the `response` phase and
+   `body_filter`/`header_filter`** (Kong refuses to start). `straiker` uses
+   `body_filter` to accumulate the response, so the response-phase approach has
+   to be its own plugin.
+
+`straiker-saas` does everything **synchronously**, with **no timers, no
+`body_filter`/`header_filter`, no `init_worker`, no filesystem writes, and no
+custom-module requires** — so it loads unmodified on Dedicated Cloud as two
+self-contained files (`handler.lua` + `schema.lua`).
+
+### 13.2 How it works
+
+| Phase | What it does |
+|---|---|
+| **`access`** | Synchronous input guardrail + blocking; app-source resolution (Entra/OIDC JWT claim or header, §10); agentic tool-trace capture from the request `messages[]`; enables buffered proxying. |
+| **`response`** | Reads the fully-buffered upstream answer (Kong's [`response` phase](https://developer.konghq.com/gateway/entities/plugin/#response-phase) — the same buffered post-response hook `ai-response-transformer` uses), scores it synchronously, and can **block / replace** it before the client sees it. |
+
+This means `straiker-saas` adds a capability the timer build doesn't have:
+**post-call response blocking** (`block_response`). The model's answer is scored
+before it reaches the client, and a flagged answer is withheld.
+
+### 13.3 Parity with `straiker`
+
+| Capability | `straiker` (timer) | `straiker-saas` (response phase) |
+|---|---|---|
+| Pre-call input guardrail + blocking | ✅ | ✅ |
+| Agentic tool-trace (full `messages[]`, tool_calls reshaped) | ✅ | ✅ |
+| App-source resolution (Entra/OIDC `jwt_app_claim`, `app_id_header`) | ✅ | ✅ |
+| Post-call response evaluation (observability) | ✅ (async, fire-and-forget) | ✅ (synchronous, adds latency) |
+| **Post-call response blocking** | ❌ | ✅ (`block_response`) |
+| Token streaming to client (`stream: true`) | ✅ | ❌ buffered (see §13.5) |
+| MCP discovery (preview) | ✅ (off by default) | ❌ (handled server-side) |
+| Background timers / `init_worker` | uses a timer | none (sandbox-safe) |
+
+### 13.4 Config differences vs `straiker`
+
+`straiker-saas` keeps the same field names and defaults as `straiker` (so a route
+can move between builds with the same config), with these differences:
+
+- **New: `block_response`** (bool, default `false`). When `true` and the model's
+  answer scores over `threshold`, the answer is withheld and replaced (403 if
+  `verbose_block`, else a safe 200). Default `false` = response is scored for
+  visibility only and always forwarded.
+- **Removed: `ai_proxy_advanced_compat`**. The response phase reads the buffered
+  body directly and auto-detects SSE vs JSON by Content-Type — no flag needed.
+- **Removed: the MCP fields** (`mcp_discovery`, `mcp_server_name`, `mcp_source`).
+
+`mode`, `agentic`, `blocking`, `verbose_block`, `threshold`, `timeout`,
+`fail_open`, `source`, `destination`, `app_id_header`, `jwt_app_claim`, `api_key`,
+`detect_url` all behave exactly as documented for `straiker`.
+
+### 13.5 The streaming trade-off (read this)
+
+Implementing the `response` phase auto-enables **buffered proxying**: Kong holds
+the entire upstream response before sending any of it to the client. Consequences:
+
+- **Token streaming (`stream: true`) is buffered** — the client receives the whole
+  answer at once at the end, not incrementally. Functionally correct, but it
+  defeats the point of streaming.
+- **HTTP/2 and gRPC upstreams are not supported** under buffered proxying.
+- **Non-streaming JSON responses are unaffected.**
+
+If you need true token streaming to the client, keep that route on a self-hosted
+or hybrid gateway with the `straiker` plugin. The `straiker-saas` build is for
+Dedicated Cloud, where the timer ban makes the response phase the only way to do
+synchronous response evaluation and blocking.
+
+### 13.6 Uploading to a Dedicated Cloud Gateway
+
+The sandbox accepts exactly two files. Upload via the Konnect UI
+(**Gateway Manager → your control plane → Plugins → Custom Plugins → New**) or the API:
+
+```bash
+curl -X POST "$KONNECT_ADMIN_API/core-entities/custom-plugins" \
+  -H "Authorization: Bearer $KONNECT_PAT" -H "Content-Type: application/json" \
+  -d "{\"name\":\"straiker-saas\",
+       \"handler\": $(jq -Rs . < kong/plugins/straiker-saas/handler.lua),
+       \"schema\":  $(jq -Rs . < kong/plugins/straiker-saas/schema.lua)}"
+```
+
+Then attach `straiker-saas` to your routes like any other plugin. Place it on a
+route alongside `ai-proxy-advanced` (and `openid-connect` for the Entra flow),
+exactly as you would `straiker`.
+
+### 13.7 Validation status
+
+Validated on a Konnect self-managed data plane (Kong 3.14) — same runtime as a
+Dedicated Cloud gateway, with `ai-proxy-advanced` + `openid-connect` on the route:
+
+- **Response phase + `ai-proxy-advanced` coexist** under buffered proxying — the
+  buffered OpenAI answer is read and scored, and the original answer flows through
+  unchanged when not blocked.
+- **Input blocking, response blocking, agentic tool-trace, diverse/parallel/nested
+  tool calls, Entra/OIDC app resolution, Tier-1 header enumeration, multi-model,
+  and multi-agent correlation** all verified (37/37 end-to-end checks).
+- A real tool-using agent loop (RAG search, DB lookups, calendar/email actions,
+  multi-hop and parallel tool calls) routed through the build produced rich
+  multi-step Agentic Steps in the Console.
+
+> **One open item for an actual Dedicated Cloud Gateway:** confirm the plugin
+> sandbox permits the outbound HTTP client (`resty.http`) in the `response` phase.
+> It is loaded lazily and `pcall`-guarded, so a stricter sandbox degrades to
+> fail-open rather than failing to load; Kong's own `ai-response-transformer`
+> makes outbound calls in this phase, so it is expected to work.
+
+---
+
+## 14. References
 
 - Plugin source: [`kong/plugins/straiker/handler.lua`](kong/plugins/straiker/handler.lua), [`schema.lua`](kong/plugins/straiker/schema.lua)
+- SaaS plugin source: [`kong/plugins/straiker-saas/handler.lua`](kong/plugins/straiker-saas/handler.lua), [`schema.lua`](kong/plugins/straiker-saas/schema.lua)
 - Public docs: <https://docs.straiker.ai/defend-ai/kong-gateway-integration>
 - Detect API reference: <https://docs.straiker.ai/api-reference/defend-ai-api>
 - Detect-agentic API reference: <https://docs.straiker.ai/api-reference/defend-ai-api/detect-agentic>
