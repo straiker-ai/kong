@@ -24,6 +24,16 @@ return {
               type = "boolean",
               default = true,
             } },
+          { fail_open = {
+              -- Behaviour when the Straiker webhook is unreachable or errors on the
+              -- INPUT (pre-call) check. true (default) = allow the request through
+              -- (availability-first). false = fail CLOSED — block the request when
+              -- the guardrail can't be reached. (Response/post-call evaluation
+              -- always fails open: a real model answer is never withheld because
+              -- the scorer was down.)
+              type = "boolean",
+              default = true,
+            } },
           { debug = {
               -- Enables verbose request/response/webhook logging for local
               -- validation. Keep disabled in normal deployments.

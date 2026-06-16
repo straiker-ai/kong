@@ -3,7 +3,7 @@ local helpers = require "kong.plugins.straiker.helpers"
 
 local StraikerHandler = {
   PRIORITY = 760,
-  VERSION = "0.9.0",
+  VERSION = "0.10.0",
 }
 
 local LOG_PREFIX = "[straiker]"
@@ -134,14 +134,22 @@ function StraikerHandler:access(conf)
 
   local res, err = call_straiker(conf, webhook)
 
+  -- fail_open governs the INPUT gate when the webhook is unreachable / non-200:
+  -- true (default) = allow through; false = fail CLOSED (block the unscored request).
   if not res then
     kong.log.err(LOG_PREFIX, " pre-call failed: ", err)
-    return
+    if conf.fail_open then return end
+    return kong.response.exit(503, {
+      error = { message = "Straiker unavailable: " .. tostring(err), code = "503" },
+    })
   end
 
   if res.status ~= 200 then
     kong.log.err(LOG_PREFIX, " pre-call non-200: ", res.status, " body: ", res.body)
-    return
+    if conf.fail_open then return end
+    return kong.response.exit(503, {
+      error = { message = "Straiker returned " .. res.status, code = "503" },
+    })
   end
 
   local result = cjson.decode(res.body) or {}

@@ -1,26 +1,38 @@
-# Straiker Kong Plugin — Design, Flow Matrix & Operations
+# Straiker Kong Plugin
 
-Kong Gateway plugins that call Straiker `POST /api/v1/detect` (or
-`/api/v1/detect?agentic`) on every AI request flowing through Kong. Intended as
-the production protection point in front of OpenAI, Anthropic, Bedrock, etc.
+A single Kong Gateway plugin (`straiker`) that protects AI traffic flowing
+through Kong. It buffers the upstream response and sends **pre-call and post-call
+events to the Straiker webhook API** (`POST /api/v1/detect/webhook`), forwarding
+the raw request/response, the extracted prompt/response text, the **Kong consumer
+identity**, request metadata, and ai-proxy context. Straiker performs detection
+and returns `{ action, score, turn_id }`; the plugin enforces `action == "block"`.
 
-The repo ships **two builds of the same capability**, one per deployment topology:
+**Detection policy lives in the Straiker Console, per application** — selected at
+runtime by the caller's identity (the Kong consumer, e.g. mapped from a Microsoft
+Entra claim via `openid-connect` `consumer_claim`). The gateway plugin is
+intentionally near-zero-config:
 
-| Plugin | For | How post-call works |
+| Config | Default | Purpose |
 |---|---|---|
-| **`straiker`** | Self-hosted Kong (OSS/Enterprise) and Konnect **hybrid** (self-managed data plane) | Timer-based, fire-and-forget — streaming-friendly, full feature set |
-| **`straiker-saas`** | Konnect **full-SaaS Dedicated Cloud Gateways** | Buffered `response` phase (no timers — the Dedicated Cloud sandbox forbids them); synchronous response eval **and** response blocking. Buffers the answer, so token streaming is unsupported on this build |
+| `api_key` | (required) | Straiker API key (encrypted, vault-referenceable). |
+| `detect_url` | `…/api/v1/detect/webhook` | Straiker webhook endpoint. |
+| `block` | `true` | Enforce Straiker's block action on input + response. `false` = evaluate/log only. |
+| `fail_open` | `true` | If the webhook is unreachable on the **input** check: `true` = allow (availability-first); `false` = fail **closed** (block). Response/post-call always fails open. |
+| `debug` | `false` | Verbose request/response/webhook logging. |
 
-**Which one do I use?** See **§12 Deployment patterns & support matrix**. The
-`straiker-saas` build is documented in **§13**. Sections 1–11 describe the
-`straiker` plugin; almost everything (config, the flow matrix, app-source
-resolution) applies to both — §13 covers only the differences.
+Install (self-hosted / Konnect hybrid — bake into the DP image or `luarocks install`):
 
-This document is the source of truth on how the plugins behave. Read sections
-1–3 to understand the architecture; section 4 is the **flow matrix** that
-explains exactly what shows up in the Straiker Console for every combination
-of route type (chatbot vs agentic), control mode (detect vs block), and
-request outcome (allowed vs blocked).
+```bash
+luarocks install https://github.com/PhimmStraiker/kong-plugin-straiker/releases/download/v0.10.0/kong-plugin-straiker-0.10.0-1.all.rock
+export KONG_PLUGINS=bundled,straiker
+kong reload
+```
+
+> **Doc status:** v0.10.0 collapsed the earlier two-plugin design (`straiker` +
+> `straiker-saas`, the per-provider translators, and the `mode`/`agentic`/
+> `jwt_app_claim`/`source`/`threshold` config) into this single webhook-based
+> plugin. **Sections below predate v0.10.0 and are being rewritten** — treat this
+> overview as authoritative for current behavior.
 
 ---
 
