@@ -2,4 +2,5 @@ FROM kong/kong-gateway:3.14
 USER root
 COPY kong/plugins/straiker-shared/ /usr/local/share/lua/5.1/kong/plugins/straiker-shared/
 COPY kong/plugins/straiker/ /usr/local/share/lua/5.1/kong/plugins/straiker/
+COPY kong/plugins/straiker-saas/ /usr/local/share/lua/5.1/kong/plugins/straiker-saas/
 USER kong

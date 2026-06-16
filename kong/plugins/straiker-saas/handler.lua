@@ -3,7 +3,7 @@ local helpers = require "kong.plugins.straiker-shared.helpers"
 
 local StraikerSaaS = {
   PRIORITY = 760,
-  VERSION = "0.8.0",
+  VERSION = "0.9.0",
 }
 
 local LOG_PREFIX = "[straiker-saas]"

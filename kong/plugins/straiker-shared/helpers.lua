@@ -151,6 +151,28 @@ function _M.resolve_app_source(conf, headers, log_prefix)
     kong.log.debug(log_prefix, " no consumer on this request")
   end
 
+  -- Tier 3: jwt_app_claim — derive the app id directly from a validated JWT
+  -- claim. Microsoft Entra / Azure AD app-only (client-credentials) tokens carry
+  -- the calling app's client id in `azp` (token v2) or `appid` (v1). Reuses
+  -- decode_jwt_claims, so it reads the openid-connect-validated token from
+  -- kong.ctx.shared and survives ai-proxy-advanced swapping Authorization. This
+  -- enables Entra app enumeration WITHOUT pre-creating a Kong consumer per app.
+  if conf.jwt_app_claim and conf.jwt_app_claim ~= "" and conf.jwt_app_claim ~= "off" then
+    local claims = _M.decode_jwt_claims(headers, log_prefix)
+    if claims then
+      local val
+      if conf.jwt_app_claim == "auto" then
+        val = claims.app_displayname or claims.azp or claims.appid
+      else
+        val = claims[conf.jwt_app_claim]
+      end
+      if type(val) == "string" and val ~= "" then
+        kong.log.debug(log_prefix, " app from JWT claim ", conf.jwt_app_claim, ": ", val)
+        return val
+      end
+    end
+  end
+
   return nil
 end
 

@@ -38,7 +38,7 @@ data plane)** — one command installs both plugins; enable whichever the topolo
 needs via `KONG_PLUGINS`:
 
 ```bash
-luarocks install https://github.com/PhimmStraiker/kong-plugin-straiker/releases/download/v0.8.0/kong-plugin-straiker-0.8.0-1.all.rock
+luarocks install https://github.com/PhimmStraiker/kong-plugin-straiker/releases/download/v0.9.0/kong-plugin-straiker-0.9.0-1.all.rock
 export KONG_PLUGINS=bundled,straiker          # self-hosted / hybrid (timer build)
 # export KONG_PLUGINS=bundled,straiker-saas   # response-phase build (also fine here)
 kong reload
@@ -275,21 +275,23 @@ application, and a new value auto-creates a new app profile. v0.6.0 derives
 `source` per request from the **verified caller identity**, so every app team
 gets its own profile automatically — one Kong route, one key, no per-app setup.
 
-### 10.2 Three ways to resolve the app identity
+### 10.2 Ways to resolve the app identity
 
-`resolve_app_source()` tries three tiers in order; the configured `source` is
-the fallback when none resolve.
+`resolve_app_source()` tries these in order; the configured `source` is the
+fallback when none resolve.
 
 | Tier | Config | Where the identity comes from | Verified by Kong? |
 |---|---|---|---|
-| **1** | `app_id_header` | A request header (e.g. `x-app-id`) set by an edge component, a `request-transformer`, or the app itself | Depends on who set it |
-| **2** | `jwt_app_claim` | The validated JWT in `kong.ctx.shared.authenticated_jwt_token`, left there by `openid-connect` or the `jwt` plugin | **Yes** — signature-checked against the IdP |
-| **3** | `jwt_app_claim` | The raw `Authorization: Bearer` token, decoded directly | No |
+| **1** | `app_id_header` | A request header (e.g. `x-app-id`) set by an edge component, a `request-transformer`, the app, or by `openid-connect` claim injection | Depends on who set it |
+| **2** | (none) | The **Kong consumer** (`consumer.username` / `custom_id`) mapped by the auth plugin — e.g. `openid-connect` `consumer_claim`. The Kong-native identity model; `consumer.username` becomes the app name | **Yes** — mapped from the validated token |
+| **3** | `jwt_app_claim` | A claim in the validated JWT (`kong.ctx.shared.authenticated_jwt_token`, falling back to the `Authorization` bearer). Entra app-only tokens carry the client id in `azp` (v2) / `appid` (v1); `"auto"` resolves `app_displayname → azp → appid` | **Yes** — signature-checked against the IdP |
 
-**For Microsoft Entra / Azure AD, use Tier 2.** It is the only path that is both
-automatic (the app sends only its normal token) *and* signature-verified (Kong
-rejects forged tokens before the plugin runs). The rest of this section focuses
-on it.
+**For Microsoft Entra / Azure AD there are two good paths:** map the token to a
+**Kong consumer** (Tier 2 — gives a friendly app name in the Console), or read the
+`azp`/`appid` claim directly with **`jwt_app_claim`** (Tier 3 — no consumer to
+pre-create). Both are signature-verified and survive `ai-proxy-advanced` replacing
+the `Authorization` header. The rest of this section focuses on the JWT-claim path;
+the consumer path is the same idea with `openid-connect`'s `consumer_claim`.
 
 ### 10.3 The verified Entra production pattern (Tier 2)
 
@@ -537,7 +539,7 @@ determines which Straiker plugin you use.
 ### 12.1 Self-hosted install
 
 ```bash
-luarocks install .../kong-plugin-straiker-0.8.0-1.all.rock   # or bake into your Kong Docker image
+luarocks install .../kong-plugin-straiker-0.9.0-1.all.rock   # or bake into your Kong Docker image
 export KONG_PLUGINS=bundled,straiker
 kong reload
 ```
@@ -589,9 +591,18 @@ plugins in a sandbox.
    to be its own plugin.
 
 `straiker-saas` does everything **synchronously**, with **no timers, no
-`body_filter`/`header_filter`, no `init_worker`, no filesystem writes, and no
-custom-module requires** — so it loads unmodified on Dedicated Cloud as two
-self-contained files (`handler.lua` + `schema.lua`).
+`body_filter`/`header_filter`, no `init_worker`, and no filesystem writes**.
+
+> **Dedicated Cloud packaging note (v0.9.0+):** `straiker-saas` now shares code
+> with the `straiker` plugin via `kong.plugins.straiker-shared` (helpers +
+> per-provider translators). On self-hosted / Konnect hybrid that's transparent
+> (the rock and the Docker image ship the `straiker-shared` directory). The
+> Konnect **Dedicated Cloud** custom-plugin sandbox, however, accepts only
+> `handler.lua` + `schema.lua` and **blocks custom-module requires** — so for a
+> Dedicated Cloud upload the shared modules must be **bundled/inlined into a
+> single `handler.lua`** (a build step). Until that bundling step exists, treat
+> Dedicated Cloud as the target that needs it; self-hosted and hybrid are
+> unaffected.
 
 ### 13.2 How it works
 
@@ -652,7 +663,10 @@ synchronous response evaluation and blocking.
 
 ### 13.6 Uploading to a Dedicated Cloud Gateway
 
-The sandbox accepts exactly two files. Upload via the Konnect UI
+The sandbox accepts exactly two files (`handler.lua` + `schema.lua`) and blocks
+custom-module requires, so first **bundle the `straiker-shared` modules into a
+single `handler.lua`** (see the packaging note in §13.1). Then upload that bundled
+`handler.lua` + `schema.lua` via the Konnect UI
 (**Gateway Manager → your control plane → Plugins → Custom Plugins → New**) or the API:
 
 ```bash
