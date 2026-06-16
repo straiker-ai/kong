@@ -43,7 +43,7 @@ return {
             } },
           { source = {
               type = "string",
-              default = "kong-plugin",
+              default = "Kong Default App",
             } },
           { threshold = {
               type = "number",
