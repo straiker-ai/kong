@@ -54,19 +54,8 @@ dependencies = {
 build = {
    type = "builtin",
    modules = {
-      ["kong.plugins.straiker.handler"]      = "kong/plugins/straiker/handler.lua",
-      ["kong.plugins.straiker.schema"]       = "kong/plugins/straiker/schema.lua",
-      ["kong.plugins.straiker-saas.handler"] = "kong/plugins/straiker-saas/handler.lua",
-      ["kong.plugins.straiker-saas.schema"]  = "kong/plugins/straiker-saas/schema.lua",
-      ["kong.plugins.straiker-shared.helpers"]               = "kong/plugins/straiker-shared/helpers.lua",
-      ["kong.plugins.straiker-shared.translator.init"]       = "kong/plugins/straiker-shared/translator/init.lua",
-      ["kong.plugins.straiker-shared.translator.model"]      = "kong/plugins/straiker-shared/translator/model.lua",
-      ["kong.plugins.straiker-shared.translator.openai"]     = "kong/plugins/straiker-shared/translator/openai.lua",
-      ["kong.plugins.straiker-shared.translator.anthropic"]  = "kong/plugins/straiker-shared/translator/anthropic.lua",
-      ["kong.plugins.straiker-shared.translator.bedrock"]    = "kong/plugins/straiker-shared/translator/bedrock.lua",
-      ["kong.plugins.straiker-shared.translator.gemini"]     = "kong/plugins/straiker-shared/translator/gemini.lua",
-      ["kong.plugins.straiker-shared.translator.cohere"]     = "kong/plugins/straiker-shared/translator/cohere.lua",
-      ["kong.plugins.straiker-shared.translator.azureai"]    = "kong/plugins/straiker-shared/translator/azureai.lua",
-      ["kong.plugins.straiker-shared.translator.kong"]       = "kong/plugins/straiker-shared/translator/kong.lua",
+      ["kong.plugins.straiker.handler"] = "kong/plugins/straiker/handler.lua",
+      ["kong.plugins.straiker.schema"]  = "kong/plugins/straiker/schema.lua",
+      ["kong.plugins.straiker.helpers"] = "kong/plugins/straiker/helpers.lua",
    },
 }

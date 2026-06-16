@@ -15,109 +15,20 @@ return {
             } },
           { detect_url = {
               type = "string",
-              default = "https://api.prod.straiker.ai/api/v1/detect",
+              default = "https://api.prod.straiker.ai/api/v1/detect/webhook",
             } },
-          { mode = {
-              type = "string",
-              default = "both",
-              one_of = { "pre_call", "post_call", "both" },
+          { block = {
+              -- When true, Straiker detections can block both the incoming agent
+              -- turn and the final model response. When false, detections are
+              -- evaluated and logged but traffic is never blocked.
+              type = "boolean",
+              default = true,
             } },
-          { agentic = {
+          { debug = {
+              -- Enables verbose request/response/webhook logging for local
+              -- validation. Keep disabled in normal deployments.
               type = "boolean",
               default = false,
-            } },
-          { destination = {
-              type = "string",
-              default = "api.openai.com",
-            } },
-          { source = {
-              type = "string",
-              default = "Kong Default App",
-            } },
-          { threshold = {
-              type = "number",
-              default = 0.5,
-              between = { 0, 1 },
-            } },
-          { timeout = {
-              type = "number",
-              default = 5000,
-            } },
-          { fail_open = {
-              type = "boolean",
-              default = false,
-            } },
-          { ai_proxy_advanced_compat = {
-              type = "boolean",
-              default = false,
-            } },
-          { blocking = {
-              type = "boolean",
-              default = false,
-            } },
-          { verbose_block = {
-              type = "boolean",
-              default = false,
-            } },
-          { app_id_header = {
-              -- Tier 1. Request header name that already carries the app id
-              -- (e.g. "x-app-id"). Highest-priority source. Use when an upstream
-              -- edge component, a request-transformer, or the calling app sets
-              -- the header directly.
-              -- NOTE: Kong openid-connect's claim-to-header injection maps
-              -- id_token / userinfo claims, NOT bearer access-token claims, so it
-              -- does not populate this for app-only Entra tokens — use
-              -- jwt_app_claim (Tier 2) for the Entra/Azure AD flow.
-              -- "off" = disabled (default).
-              type = "string",
-              default = "off",
-            } },
-          { jwt_app_claim = {
-              -- Tiers 2-3. JWT claim to use as the per-request source. This is the
-              -- Microsoft Entra / Azure AD path; pair with Kong's openid-connect
-              -- (or jwt) plugin.
-              -- "auto"  → tries app_displayname → azp (Entra v2) → appid (Entra v1)
-              --           Recommended: real app-only (client-credentials) tokens
-              --           default to v1 and carry `appid`, not `azp`.
-              -- "azp"   → Entra v2 authorized-party / app registration client ID
-              -- "appid" → Entra v1 app registration client ID
-              -- "off"   → disabled; use configured source as-is (default)
-              -- Where the verified JWT comes from:
-              --   1. kong.ctx.shared.authenticated_jwt_token — set by the
-              --      openid-connect plugin (Entra, validated vs tenant JWKS) OR
-              --      the free jwt plugin. Survives ai-proxy-advanced replacing
-              --      the Authorization header (it is request context). PREFERRED.
-              --   2. Authorization: Bearer header (direct decode) — fallback for
-              --      routes with no auth plugin; NOT available once ai-proxy /
-              --      ai-proxy-advanced has replaced the header.
-              type = "string",
-              default = "off",
-            } },
-          { mcp_discovery = {
-              -- Enable on a route that fronts a network-hosted MCP server
-              -- (Streamable HTTP / SSE). The plugin parses the JSON-RPC body and
-              -- emits a `beforeMCPExecution` event per distinct tools/call to the
-              -- Straiker coding-agent ingest, so the server is inventoried in the
-              -- Console's Discovered MCP Servers. Server identity (name + URL) is
-              -- derived from the Kong upstream; tool name from JSON-RPC params.name.
-              -- Emits are deduped per (server, tool). Default off.
-              type = "boolean",
-              default = false,
-            } },
-          { mcp_server_name = {
-              -- Optional override for the discovered server name. When "off",
-              -- the name is derived from the Kong upstream service (its host —
-              -- the MCP server FQDN — or service name).
-              type = "string",
-              default = "off",
-            } },
-          { mcp_source = {
-              -- The `x-tool` label sent with MCP-discovery events. The Straiker
-              -- detect endpoint routes the event through the agent-event ingest
-              -- based on this value. Default "kong"; requires backend support for
-              -- the configured source value.
-              type = "string",
-              default = "kong",
             } },
         },
     } },
