@@ -174,7 +174,7 @@ function StraikerHandler:response(conf)
   if not kong.ctx.plugin.prompt then return end
   if kong.ctx.plugin.blocked then return end
 
-  local raw_body = kong.service.response.get_raw_body()
+  local raw_body = kong.response.get_raw_body()
   if not raw_body or raw_body == "" then return end
 
   if conf.debug then
@@ -194,10 +194,9 @@ function StraikerHandler:response(conf)
   local is_sse = ct:find("text/event-stream", 1, true) ~= nil
 
   local app_response, has_tool_calls = "", false
+  local stream_chunks = nil
   if is_sse then
-    local content, tool_calls = helpers.parse_sse_buffer(raw_body)
-    app_response = content
-    has_tool_calls = tool_calls ~= nil
+    stream_chunks = helpers.parse_sse_chunks(raw_body)
   else
     local resp = cjson.decode(raw_body)
     if resp and resp.choices and resp.choices[1] and resp.choices[1].message then
@@ -227,14 +226,18 @@ function StraikerHandler:response(conf)
   local webhook = kong.ctx.plugin.webhook
   if kong.ctx.plugin.webhook then
     webhook.eventType = "post_call"
-    helpers.add_webhook_response(webhook, resp_body, app_response)
+    if is_sse then
+      helpers.add_webhook_stream_response(webhook, stream_chunks or {})
+    else
+      helpers.add_webhook_response(webhook, resp_body, app_response)
+    end
     if conf.debug then
       kong.log.notice(LOG_PREFIX, " webhook post_call: ", cjson.encode(webhook))
     end
   end
 
   if has_tool_calls then return end
-  if app_response == "" then return end
+  if not is_sse and app_response == "" then return end
 
   if not webhook then return end
 

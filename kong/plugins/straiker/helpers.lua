@@ -70,55 +70,45 @@ function _M.resolve_user_name(headers, body, log_prefix, debug)
   return "kong"
 end
 
-function _M.parse_sse_buffer(buf)
-  local content_parts = {}
-  local tool_call_acc = {}
-  local saw_tool_calls = false
+function _M.parse_sse_chunks(buf)
+  local chunks = {}
+  local current_event = nil
+  local data_lines = {}
 
-  for line in buf:gmatch("[^\r\n]+") do
-    local data = line:match("^data:%s*(.+)$")
-    if data and data ~= "[DONE]" then
-      local ok, evt = pcall(cjson.decode, data)
-      if ok and type(evt) == "table" and evt.choices and evt.choices[1] then
-        local delta = evt.choices[1].delta or evt.choices[1].message
-        if delta then
-          if type(delta.content) == "string" and delta.content ~= "" then
-            table.insert(content_parts, delta.content)
-          end
-          if type(delta.tool_calls) == "table" then
-            saw_tool_calls = true
-            for _, tc in ipairs(delta.tool_calls) do
-              local idx = tc.index or (#tool_call_acc + 1)
-              local slot = tool_call_acc[idx] or { ["function"] = { arguments = "" } }
-              if tc.id then slot.id = tc.id end
-              if tc.type then slot.type = tc.type end
-              if tc["function"] then
-                if tc["function"].name then slot["function"].name = tc["function"].name end
-                if tc["function"].arguments then
-                  slot["function"].arguments = (slot["function"].arguments or "") .. tc["function"].arguments
-                end
-              end
-              tool_call_acc[idx] = slot
-            end
-          end
+  local function flush_chunk()
+    if #data_lines == 0 and not current_event then return end
+
+    local data = table.concat(data_lines, "\n")
+    local chunk = {}
+    if current_event then chunk.event = current_event end
+    if data ~= "" then
+      local ok, decoded = pcall(cjson.decode, data)
+      chunk.data = ok and decoded or data
+    end
+    chunks[#chunks + 1] = chunk
+
+    current_event = nil
+    data_lines = {}
+  end
+
+  local normalized = buf:gsub("\r\n", "\n"):gsub("\r", "\n")
+  for line in (normalized .. "\n"):gmatch("([^\n]*)\n") do
+    if line == "" then
+      flush_chunk()
+    else
+      local event = line:match("^event:%s*(.*)$")
+      if event then
+        current_event = event
+      else
+        local data = line:match("^data:%s*(.*)$")
+        if data then
+          data_lines[#data_lines + 1] = data
         end
       end
     end
   end
 
-  local tool_calls = nil
-  if saw_tool_calls then
-    tool_calls = {}
-    local indices = {}
-    for idx in pairs(tool_call_acc) do
-      indices[#indices + 1] = idx
-    end
-    table.sort(indices)
-    for _, idx in ipairs(indices) do
-      tool_calls[#tool_calls + 1] = tool_call_acc[idx]
-    end
-  end
-  return table.concat(content_parts), tool_calls
+  return chunks
 end
 
 function _M.block_payload(_, model)
@@ -200,8 +190,18 @@ end
 
 function _M.add_webhook_response(webhook_payload, resp_body, app_response)
   webhook_payload.response = {
+    stream = false,
     body = resp_body,
     text = app_response,
+  }
+  return webhook_payload
+end
+
+function _M.add_webhook_stream_response(webhook_payload, chunks)
+  webhook_payload.response = {
+    stream = true,
+    chunks = chunks,
+    text = cjson.null,
   }
   return webhook_payload
 end
