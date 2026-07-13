@@ -18,6 +18,7 @@ Integrating Straiker with Kong Gateway allows you to:
 
 ## Documentation
 
+- [Straiker + Kong: what you get](docs/use-cases.md) — the security value of running Straiker on Kong
 - [Kong Gateway Integration Guide](https://docs.straiker.ai/defend-ai/kong-gateway-integration) — Straiker product docs
 - [Straiker Defend AI Docs](https://docs.straiker.ai) — all product documentation
 - Contact your Straiker team for enterprise API keys and sandbox access
