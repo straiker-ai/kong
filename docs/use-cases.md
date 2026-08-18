@@ -2,7 +2,35 @@
 
 # Straiker + Kong: what you get
 
-As teams route more of their builder and agent traffic through Kong AI Gateway, Straiker secures it. One plugin on the route, and every AI call is checked and blocked at the gateway, with no SDK in your apps. Securing agentic traffic is what Straiker does. It is in our DNA.
+As teams route more of their builder and agent traffic through Kong AI Gateway, Straiker Defend secures it. One plugin on the route, and every AI call is checked and blocked at the gateway, with no SDK in your apps.
+
+There are two shapes of traffic, and a plugin for each:
+
+| | Chat applications | Coding agents (Claude Code and similar) |
+| --- | --- | --- |
+| Plugin | `straiker` | `straiker-coding-agent-streaming` or `straiker-coding-agent-buffered` |
+| What you stop | Prompt injection, data leakage, unsafe output | Prompts, poisoned tool results, and (buffered) tool calls before they run |
+
+Pick the plugin in the [README](../README.md). The rest of this page is the security value of putting Straiker Defend on Kong.
+
+## Coding agents on the gateway
+
+Tools run on the developer laptop, but every model call crosses the gateway — so Kong is a single control point for agent traffic, with nothing to install on developer machines. It also sees activity that endpoint instrumentation can miss: tool calls that fail, and `@`-mention file reads that never become a tool call.
+
+Use **streaming** on interactive developer routes. Use **buffered** on CI and unattended agents when a denied `Bash` / `Write` must never reach the client.
+
+```mermaid
+flowchart LR
+  Dev[Developer laptop]
+  Kong[Kong Gateway]
+  Defend[Straiker Defend]
+  Model[Model API]
+
+  Dev -->|Anthropic Messages| Kong
+  Kong -->|scored request / response| Defend
+  Kong -->|allowed traffic| Model
+```
+
 
 ## One place to route, discover, and secure your AI traffic
 
