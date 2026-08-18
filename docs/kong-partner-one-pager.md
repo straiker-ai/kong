@@ -41,11 +41,15 @@ categories:
 
 # Straiker AI Security Plugin
 
-The Straiker AI Security plugin protects LLM traffic flowing through Kong Gateway and Kong AI Gateway. It scans prompts before they reach the upstream model and scans model responses before they return to the client.
+The Straiker AI Security plugin (`straiker`) protects **chat and application** LLM traffic flowing through Kong Gateway and Kong AI Gateway. It scans prompts before they reach the upstream model and scans model responses before they return to the client.
 
-The plugin sends structured pre-call and post-call events to the Straiker Detect Webhook. Straiker evaluates the interaction against policies configured in the Straiker Console and returns a decision. Based on the decision, the plugin either forwards the traffic or blocks it at the gateway.
+For **Claude Code and other coding agents**, this rock also ships `straiker-coding-agent-streaming` and `straiker-coding-agent-buffered`. See the [repository README](https://github.com/straiker-ai/kong) for which plugin to attach.
 
-> This plugin is designed to run with the [AI Proxy](https://developer.konghq.com/plugins/ai-proxy/) or [AI Proxy Advanced](https://developer.konghq.com/plugins/ai-proxy-advanced/) plugin. To set up AI Proxy quickly, see [Get started with AI Gateway](https://developer.konghq.com/ai-gateway/get-started/).
+The chat plugin sends structured pre-call and post-call events to the Straiker Defend webhook. Straiker Defend evaluates the interaction against policies configured in the Straiker Console and returns a decision. Based on the decision, the plugin either forwards the traffic or blocks it at the gateway.
+
+> The `straiker` plugin is designed to run with the [AI Proxy](https://developer.konghq.com/plugins/ai-proxy/) or [AI Proxy Advanced](https://developer.konghq.com/plugins/ai-proxy-advanced/) plugin. To set up AI Proxy quickly, see [Get started with AI Gateway](https://developer.konghq.com/ai-gateway/get-started/).
+>
+> The coding-agent plugins do **not** use AI Proxy — they proxy Anthropic Messages directly. AI Proxy may front `straiker-coding-agent-streaming`, but **not** `straiker-coding-agent-buffered`: AI Proxy clears Kong's response buffering whenever the client streams, and coding agents always stream, so the buffered plugin stops enforcing while still returning `200` with an allow verdict. Inject the upstream credential with `request-transformer` on that route instead.
 
 Integrating Straiker with Kong Gateway allows you to:
 
@@ -152,14 +156,18 @@ In Konnect hybrid mode, upload the plugin schema to the control plane and deploy
      --data "{\"lua_schema\": $(jq -Rs '.' kong/plugins/straiker/schema.lua)}"
    ```
 
+   Coding-agent plugins need their own schema upload. See the [README](https://github.com/straiker-ai/kong#install).
+
 1. Build a custom Kong Gateway data plane image:
 
    ```dockerfile
    FROM kong/kong-gateway:3.14
    USER root
    COPY kong/plugins/straiker/ /usr/local/share/lua/5.1/kong/plugins/straiker/
+   COPY kong/plugins/straiker-coding-agent-streaming/ /usr/local/share/lua/5.1/kong/plugins/straiker-coding-agent-streaming/
+   COPY kong/plugins/straiker-coding-agent-buffered/ /usr/local/share/lua/5.1/kong/plugins/straiker-coding-agent-buffered/
    USER kong
-   ENV KONG_PLUGINS=bundled,straiker
+   ENV KONG_PLUGINS=bundled,straiker,straiker-coding-agent-streaming,straiker-coding-agent-buffered
    ```
 
 1. Deploy the image as a Konnect data plane node and confirm it connects to the control plane.
@@ -172,15 +180,19 @@ For self-managed Kong Gateway, build a custom image with the plugin files:
 FROM kong/kong-gateway:3.14
 USER root
 COPY kong/plugins/straiker/ /usr/local/share/lua/5.1/kong/plugins/straiker/
+COPY kong/plugins/straiker-coding-agent-streaming/ /usr/local/share/lua/5.1/kong/plugins/straiker-coding-agent-streaming/
+COPY kong/plugins/straiker-coding-agent-buffered/ /usr/local/share/lua/5.1/kong/plugins/straiker-coding-agent-buffered/
 USER kong
-ENV KONG_PLUGINS=bundled,straiker
+ENV KONG_PLUGINS=bundled,straiker,straiker-coding-agent-streaming,straiker-coding-agent-buffered
 ```
 
 Build and run the image:
 
 ```sh
-docker build -t kong-straiker:latest .
-docker run -e KONG_DATABASE=off -e KONG_PLUGINS=bundled,straiker kong-straiker:latest
+docker build -f Dockerfile.konnect -t kong-straiker:latest .
+docker run -e KONG_DATABASE=off \
+  -e KONG_PLUGINS=bundled,straiker,straiker-coding-agent-streaming,straiker-coding-agent-buffered \
+  kong-straiker:latest
 ```
 
 ### LuaRocks
@@ -188,8 +200,8 @@ docker run -e KONG_DATABASE=off -e KONG_PLUGINS=bundled,straiker kong-straiker:l
 If using a Kong installation with LuaRocks access, install the packaged rock and reload Kong:
 
 ```sh
-luarocks install https://github.com/PhimmStraiker/kong-plugin-straiker/releases/download/v0.10.0/kong-plugin-straiker-0.10.0-1.all.rock
-export KONG_PLUGINS=bundled,straiker
+luarocks install https://github.com/straiker-ai/kong/releases/download/v0.11.0/kong-plugin-straiker-0.11.0-1.all.rock
+export KONG_PLUGINS=bundled,straiker,straiker-coding-agent-streaming,straiker-coding-agent-buffered
 kong reload
 ```
 
