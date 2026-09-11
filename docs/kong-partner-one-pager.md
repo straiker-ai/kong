@@ -200,7 +200,7 @@ docker run -e KONG_DATABASE=off \
 If using a Kong installation with LuaRocks access, install the packaged rock and reload Kong:
 
 ```sh
-luarocks install https://github.com/straiker-ai/kong/releases/download/v0.11.0/kong-plugin-straiker-0.11.0-1.all.rock
+luarocks install https://github.com/straiker-ai/kong/releases/download/v0.11.1/kong-plugin-straiker-0.11.1-1.all.rock
 export KONG_PLUGINS=bundled,straiker,straiker-coding-agent-streaming,straiker-coding-agent-buffered
 kong reload
 ```

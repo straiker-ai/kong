@@ -1,13 +1,16 @@
 -- Config schema for straiker-coding-agent-streaming.
 --
--- SELF-CONTAINED BY REQUIREMENT. Konnect hybrid rejects a schema that
--- require()s anything, including typedefs. The handler is free to require
--- shared modules; this file is not.
+-- SELF-CONTAINED BY REQUIREMENT. Konnect rejects a schema that require()s
+-- anything, including kong.db.schema.typedefs, and Kong streaming custom
+-- plugins ship only handler.lua and schema.lua. The protocols field below
+-- is the expansion of typedefs.protocols_http: constants.PROTOCOLS_WITH_
+-- SUBSYSTEM filtered to subsystem "http" and sorted.
 --
 -- The shared field block is duplicated with straiker-coding-agent-buffered.
--- Keep the two copies byte-identical when you edit either.
+-- Keep the two copies byte-identical: tools/check-shared-blocks.sh fails
+-- when they drift.
 
--- >>> SHARED BLOCK -- keep byte-identical with straiker-coding-agent-buffered <<<
+-- >>> BEGIN SHARED FIELDS <<<
 local shared_fields = {
   { detect_url = {
       type = "string", match = "^https?://",
@@ -31,11 +34,13 @@ local shared_fields = {
       description = "Skip response scoring above this size, in bytes.",
   } },
 }
--- >>> END SHARED BLOCK <<<
+-- >>> END SHARED FIELDS <<<
 
+-- Streaming-only fields. The buffered variant scores the response inline and
+-- has no async relay, so these have no meaning there.
 shared_fields[#shared_fields + 1] = { relay_response = {
     type = "boolean", default = true,
-    description = "Relay the model's streamed response to Straiker Defend after it has shipped.",
+    description = "Relay the model's streamed response to Straiker Defend after it has shipped. Runs in ngx.timer, because log_by_lua forbids cosockets. Set false to skip it; the buffered plugin scores the response inline instead.",
 } }
 shared_fields[#shared_fields + 1] = { relay_timeout_ms = {
     type = "integer", default = 15000, between = { 100, 120000 },
