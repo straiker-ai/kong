@@ -57,7 +57,9 @@ Konnect **Serverless** gateways still refuse custom plugins outright. Inline `pr
 
 ## Identity
 
-Claude Code sends no user identity. If the route already has `key-auth`, JWT, mTLS, or OIDC, the plugin forwards the Kong consumer as `x-straiker-user`. Otherwise turns are unattributed.
+Claude Code sends no user identity. If the route already has `key-auth`, JWT, mTLS, or OIDC, the plugin forwards the Kong consumer as `x-straiker-user`.
+
+Without an auth plugin, turns are **not** unattributed — they are attributed to whatever the client claims. `resolve_user()` falls back to the request's own `x-consumer-username` header, which nothing on an unauthenticated route sets but the caller, so `curl -H 'x-consumer-username: someone.else@example.com'` lands that string in Straiker as the acting user. Treat attribution on an unauthenticated route as a hint, never as evidence, and put an auth plugin on any route where it needs to hold.
 
 Do **not** put a per-developer key in `x-api-key` — Claude subscription users send `Authorization: Bearer` and no `x-api-key`. Use a dedicated header (for example `apikey`) and `hide_credentials: true` so that key is not forwarded upstream.
 

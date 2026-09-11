@@ -437,7 +437,7 @@ What Kong enforces on a streamed plugin, and what it means here:
 | 100 KB per file | Met. The largest handler is ~17 KB. |
 | `require` is gated by `KONG_UNTRUSTED_LUA` | **The one setting that matters.** All three handlers need `resty.http` and `cjson.safe`. See below. |
 | Cannot create timers | Documented, not enforced — Kong's sandbox exposes the whole `ngx` global in every mode. See [Response relay and timers](#response-relay-and-timers). |
-| No filesystem reads or writes | Met. |
+| No filesystem reads or writes | **Not met by `straiker`.** When a request body spills past the nginx buffer, `read_request_body()` falls back to `io.open` on nginx's temp file. It is wrapped in `pcall`, so a denial degrades to "no body" rather than an error, but do not assume the fallback works on a DCG — size the body buffer so it is never reached. The coding-agent plugins never touch the filesystem. |
 
 #### `KONG_UNTRUSTED_LUA`
 
@@ -448,7 +448,7 @@ A streamed handler's `require` runs inside Kong's sandbox, and the mode is set b
 | `strict` (Kong's default) | denied | **No** — the whole declarative config is rejected |
 | `lax` | allowed (`resty.http`, `cjson.safe`) | Yes |
 | `on` | unrestricted | Yes |
-| `sandbox` (deprecated) | only with `KONG_UNTRUSTED_LUA_SANDBOX_REQUIRES=resty.http,cjson.safe` | Yes, with that set |
+| `sandbox` (deprecated) | only with `KONG_UNTRUSTED_LUA_SANDBOX_REQUIRES=resty.http,cjson.safe,kong.tools.gzip` | Yes, with that set |
 | `off` | no Lua accepted at all | No |
 
 If the plugin loads, the mode is already permissive enough and there is nothing to do. If an upload fails with
@@ -459,6 +459,8 @@ handler load failure ([string "handler"]:41: require("resty.http") not allowed w
 {:.no-copy-code}
 
 then that gateway is on `strict` and needs `KONG_UNTRUSTED_LUA=lax`. It is set when the gateway is created, so decide before provisioning. This is a gateway setting — nothing in this repo changes it.
+
+**Prefer `lax` over `on`.** Both load these plugins, but the setting is gateway-wide: `on` removes the sandbox for *every* custom plugin on that gateway, including any added later by someone else. `lax` grants exactly the network and cache modules a plugin like this needs and keeps the rest of the sandbox in place. `kong.tools.gzip` belongs in the `sandbox` allowlist too — `straiker` uses it to inflate gzipped upstream responses. Its `require` is wrapped in `pcall`, so omitting it degrades to skipping decompression rather than failing, which is easy to miss.
 
 #### Response relay and timers
 
@@ -587,7 +589,9 @@ If using `ai-proxy-advanced`, increase `config.max_request_body_size` and Kong r
 
 ## Security considerations
 
+- **Identity is only as trustworthy as the route's auth.** With no auth plugin on the route, the coding-agent plugins fall back to the client's own `x-consumer-username` header, so a caller can choose the `x-straiker-user` that Straiker records. Put `key-auth`, JWT, mTLS, or OIDC on any route whose attribution you intend to rely on.
 - Store `api_key` in a Kong vault. Keep `debug=false` in production.
+- **`debug=true` writes whole prompts and model responses to the node's error log**, where anyone with log access can read them and log shipping will retain them. That is user content: treat it as regulated if your traffic is. Use it to validate an install, then turn it off — the Straiker Console is the durable record.
 - Use TLS to Straiker Defend. Alert on `fail-open-*` / webhook errors so a degraded control is visible.
 - Start with detect-only or streaming monitor routes before buffering production CI.
 - Review findings in the Straiker Console.
