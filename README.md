@@ -327,7 +327,9 @@ Vault, Konnect schema upload, per-developer identity, and verification: [docs/co
 
 ## Install
 
-Self-managed Kong (OSS or Enterprise) and Konnect **hybrid** (self-managed data planes) are supported. **Konnect Serverless and Dedicated Cloud Gateways are not** — custom plugins are rejected there.
+Self-managed Kong (OSS or Enterprise), Konnect **hybrid** (self-managed data planes), and Konnect **Dedicated Cloud Gateways** are all supported. Konnect **Serverless** gateways are not: they cannot run custom plugins at all.
+
+Every plugin here is exactly one `handler.lua` and one `schema.lua`, with no sibling modules and no `require()` in any schema. That is the shape Kong streaming custom plugins accept, so the same sources install as a rock, copy into a Docker image, or upload to a Dedicated Cloud Gateway unchanged. `tools/check-shared-blocks.sh` enforces the layout.
 
 Prerequisites:
 
@@ -366,7 +368,7 @@ docker build -f Dockerfile.konnect -t kong-straiker:latest .
 ### LuaRocks
 
 ```sh
-luarocks make kong-plugin-straiker-0.11.0-1.rockspec
+luarocks make kong-plugin-straiker-0.11.1-1.rockspec
 export KONG_PLUGINS=bundled,straiker,straiker-coding-agent-streaming,straiker-coding-agent-buffered
 kong reload
 ```
@@ -374,7 +376,7 @@ kong reload
 From a release (when published):
 
 ```sh
-luarocks install https://github.com/straiker-ai/kong/releases/download/v0.11.0/kong-plugin-straiker-0.11.0-1.all.rock
+luarocks install https://github.com/straiker-ai/kong/releases/download/v0.11.1/kong-plugin-straiker-0.11.1-1.all.rock
 ```
 
 ### Konnect hybrid
@@ -407,6 +409,66 @@ done
 ```
 
 Install the rock (or image) on **every data plane**, including `KONG_NGINX_HTTP_CLIENT_BODY_BUFFER_SIZE=32m` if you use the coding-agent plugins. Uploading a changed schema does not push it — touch another entity afterwards so data planes pull a new payload.
+
+### Konnect Dedicated Cloud Gateways
+
+Dedicated Cloud Gateways stream the whole plugin from the control plane, so there is nothing to install on a data plane. Upload the handler and the schema together, once per plugin (Gateway 3.15+):
+
+```sh
+for p in straiker straiker-coding-agent-streaming straiker-coding-agent-buffered; do
+  curl -X POST \
+    "https://us.api.konghq.com/v2/control-planes/${CONTROL_PLANE_ID}/core-entities/custom-plugins" \
+    --header "Authorization: Bearer ${KONNECT_TOKEN}" \
+    --header "Content-Type: application/json" \
+    --data "$(jq -n \
+        --arg name    "$p" \
+        --arg handler "$(cat kong/plugins/$p/handler.lua)" \
+        --arg schema  "$(cat kong/plugins/$p/schema.lua)" \
+        '{name: $name, handler: $handler, schema: $schema}')"
+done
+```
+
+What Kong enforces on a streamed plugin, and what it means here:
+
+| Kong limit | Effect |
+| --- | --- |
+| Only `handler.lua` and `schema.lua`; no other Lua modules | Met. A `require` of a sibling module fails at load with `module 'kong.plugins.straiker.…' not found`. |
+| `schema.lua` must not `require()` anything | Met. `typedefs.protocols_http` is expanded inline in all three schemas. |
+| 100 KB per file | Met. The largest handler is ~17 KB. |
+| `require` is gated by `KONG_UNTRUSTED_LUA` | **The one setting that matters.** All three handlers need `resty.http` and `cjson.safe`. See below. |
+| Cannot create timers | Documented, not enforced — Kong's sandbox exposes the whole `ngx` global in every mode. See [Response relay and timers](#response-relay-and-timers). |
+| No filesystem reads or writes | Met. |
+
+#### `KONG_UNTRUSTED_LUA`
+
+A streamed handler's `require` runs inside Kong's sandbox, and the mode is set by `KONG_UNTRUSTED_LUA` — one of the environment variables Konnect lets you set when creating a Dedicated Cloud Gateway. Kong's default is `strict`, which permits no network module at all:
+
+| Mode | `require "resty.http"` | Plugin loads? |
+| --- | --- | --- |
+| `strict` (Kong's default) | denied | **No** — the whole declarative config is rejected |
+| `lax` | allowed (`resty.http`, `cjson.safe`) | Yes |
+| `on` | unrestricted | Yes |
+| `sandbox` (deprecated) | only with `KONG_UNTRUSTED_LUA_SANDBOX_REQUIRES=resty.http,cjson.safe` | Yes, with that set |
+| `off` | no Lua accepted at all | No |
+
+If the plugin loads, the mode is already permissive enough and there is nothing to do. If an upload fails with
+
+```
+handler load failure ([string "handler"]:41: require("resty.http") not allowed within sandbox)
+```
+{:.no-copy-code}
+
+then that gateway is on `strict` and needs `KONG_UNTRUSTED_LUA=lax`. It is set when the gateway is created, so decide before provisioning. This is a gateway setting — nothing in this repo changes it.
+
+#### Response relay and timers
+
+Kong documents that a streamed plugin "cannot run in the `init_worker` phase or create timers". `straiker-coding-agent-streaming` relays the model's streamed response from `ngx.timer.at`, because `log_by_lua` forbids cosockets and `resty.http` is built on them — there is no other way to make that call once the bytes have shipped.
+
+In practice the sandbox does not block it: Kong's own `kong/tools/sandbox/configuration.lua` hands the plugin the entire `ngx` global in every mode, commented "allow full non-sandboxed access to everything in ngx global (including timers, :-()". Treat the restriction as Kong asking you not to — a timer outlives the request while holding a closure over plugin config, which is a hazard when the control plane hot-swaps streamed code — rather than as something that will fail.
+
+If a timer ever is refused, the plugin logs `relay timer spawn failed` and carries on. Requests are still inspected and still blocked; only response relay is lost, and most of that content reaches Straiker anyway on the next turn, since the client replays the assistant message (`tool_use` blocks included) in the following request. To drop the relay deliberately set `relay_response: false`, or attach `straiker-coding-agent-buffered`, which scores the response inline and needs no timer.
+
+There is no versioning for a streamed plugin. To change one, upload it under a new name, move the plugin instances to it, then delete the old one.
 
 ---
 
@@ -466,6 +528,31 @@ If Kong returns `plugin '…' not enabled`, check that:
 - Kong was restarted or reloaded after installation.
 - In Konnect hybrid, the plugin schema was uploaded to the control plane.
 
+### `handler load failure … module not found`
+
+```
+declarative configuration parse failure
+  handler load failure ([string "handler"]:10: module
+  'kong.plugins.straiker.coding_agent' not found …)
+```
+{:.no-copy-code}
+
+A streamed custom plugin is only the two files you uploaded; nothing else is on the data plane's Lua path. This error means a handler is reaching for a sibling module. Every plugin in this repo is self-contained — if you see this, you are running an upload made before the plugins were consolidated. Run `tools/check-shared-blocks.sh` to confirm the tree is streamable, then re-upload `handler.lua` and `schema.lua` for the named plugin.
+
+### `require("resty.http") not allowed within sandbox`
+
+```
+handler load failure ([string "handler"]:41:
+  require("resty.http") not allowed within sandbox)
+```
+{:.no-copy-code}
+
+Different cause from the error above, and easy to confuse with it. A module-not-found names every path Lua tried; this one never reaches the search, because the sandbox refused the `require` outright. The gateway is running `KONG_UNTRUSTED_LUA=strict` (Kong's default), which allows no network module. Set `KONG_UNTRUSTED_LUA=lax` — see [`KONG_UNTRUSTED_LUA`](#kong_untrusted_lua).
+
+### Streaming plugin logs `relay timer spawn failed`
+
+Response relay could not start a timer, so the model's streamed output was not sent to Straiker Defend. Requests are still inspected and still blocked. Most of that content also arrives on the next turn, because the client replays the assistant message in the following request; the gap is the last turn of a session. Set `relay_response: false` to stop trying, or use `straiker-coding-agent-buffered`, which scores the response inline.
+
 ### Chat traffic, no events in Straiker Defend
 
 - Valid `api_key` and egress to `detect_url` (webhook).
@@ -487,7 +574,8 @@ If using `ai-proxy-advanced`, increase `config.max_request_body_size` and Kong r
 
 ## Limitations
 
-- Konnect Serverless / Dedicated Cloud Gateways cannot run custom plugins.
+- Konnect Serverless gateways cannot run custom plugins. Dedicated Cloud Gateways can, with the constraints in [Konnect Dedicated Cloud Gateways](#konnect-dedicated-cloud-gateways).
+- A streamed plugin needs `KONG_UNTRUSTED_LUA` set to `lax` or `on`; Kong's default `strict` refuses `resty.http` and the plugin will not load.
 - Chat response scanning requires buffered responses.
 - The `straiker` plugin expects chat-completion style requests with a `messages` array.
 - Large inline multimodal payloads may require tuning Kong and `ai-proxy-advanced` request body limits.
