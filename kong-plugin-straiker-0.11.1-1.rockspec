@@ -1,5 +1,5 @@
 package = "kong-plugin-straiker"
-version = "0.11.0-1"
+version = "0.11.1-1"
 supported_platforms = { "linux", "macosx" }
 source = {
    url = "file://./",
@@ -25,11 +25,23 @@ Straiker Defend on Kong Gateway. One rock, three plugins:
       results (indirect prompt injection). Does not stop a tool_use
       before the client runs it.
 
+Every plugin is exactly one handler.lua and one schema.lua, with no
+sibling modules and no require() in any schema. That is what Kong
+streaming custom plugins accept, so the same sources install as a rock,
+copy into a Docker image, or upload to a Konnect Dedicated Cloud Gateway
+unchanged. tools/check-shared-blocks.sh enforces the layout and keeps
+the duplicated coding-agent regions byte-identical.
+
 Enable with:
   KONG_PLUGINS=bundled,straiker,straiker-coding-agent-buffered,straiker-coding-agent-streaming
 
 Never attach both coding-agent plugins to the same route. Do not attach
 the webhook plugin (straiker) to a coding-agent /v1/messages route.
+
+v0.11.1 — every plugin is now exactly one handler.lua and one
+schema.lua, so the same sources upload to a Konnect Dedicated Cloud
+Gateway as streaming custom plugins. No behaviour change. Streamed
+plugins have no versioning: re-upload both files for each plugin.
 
 v0.11.0 — add coding-agent buffered and streaming plugins.
    ]],
@@ -45,11 +57,6 @@ build = {
    modules = {
       ["kong.plugins.straiker.handler"] = "kong/plugins/straiker/handler.lua",
       ["kong.plugins.straiker.schema"]  = "kong/plugins/straiker/schema.lua",
-      ["kong.plugins.straiker.helpers"] = "kong/plugins/straiker/helpers.lua",
-      ["kong.plugins.straiker.coding_agent"] =
-         "kong/plugins/straiker/coding_agent.lua",
-      ["kong.plugins.straiker.coding_agent_deny"] =
-         "kong/plugins/straiker/coding_agent_deny.lua",
 
       ["kong.plugins.straiker-coding-agent-buffered.handler"] =
          "kong/plugins/straiker-coding-agent-buffered/handler.lua",

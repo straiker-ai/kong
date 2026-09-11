@@ -1,13 +1,237 @@
+-- Straiker Defend webhook plugin — chat and application LLM traffic.
+--
+-- Pre-call and post-call events to the Straiker Defend webhook
+-- (POST /api/v1/detect/webhook). Designed to run with AI Proxy /
+-- AI Proxy Advanced.
+--
+-- SELF-CONTAINED BY REQUIREMENT. Kong streaming custom plugins (Konnect
+-- Dedicated Cloud Gateways, Gateway 3.15+) accept exactly two files per
+-- plugin — handler.lua and schema.lua — and cannot require() a sibling
+-- module. What used to live in kong/plugins/straiker/helpers.lua is
+-- inlined below rather than required.
+
 local cjson = require "cjson.safe"
-local helpers = require "kong.plugins.straiker.helpers"
 
 local StraikerHandler = {
   PRIORITY = 760,
-  VERSION = "0.11.0",
+  VERSION = "0.11.1",
 }
 
 local LOG_PREFIX = "[straiker]"
 local DEFAULT_TIMEOUT_MS = 5000
+
+
+-- ---------------------------------------------------------------------------
+-- Helpers (formerly kong.plugins.straiker.helpers)
+-- ---------------------------------------------------------------------------
+
+local function extract_text_content(content)
+  if type(content) == "string" then
+    return content
+  elseif type(content) == "table" then
+    for _, part in ipairs(content) do
+      if type(part) == "table" and part.type == "text" and type(part.text) == "string" then
+        return part.text
+      end
+    end
+  end
+  return ""
+end
+
+local function last_user_prompt(messages)
+  if type(messages) ~= "table" then return "" end
+  for i = #messages, 1, -1 do
+    local m = messages[i]
+    if m and m.role == "user" then
+      return extract_text_content(m.content)
+    end
+  end
+  return ""
+end
+
+local function decode_jwt_claims(headers, log_prefix, debug)
+  local raw_token = kong.ctx.shared and kong.ctx.shared.authenticated_jwt_token
+  if raw_token then
+    if debug then
+      kong.log.debug(log_prefix, " authenticated_jwt_token found in kong.ctx.shared")
+    end
+  else
+    local auth = headers and (headers["authorization"] or headers["Authorization"])
+    if auth then raw_token = auth:match("^[Bb]earer%s+(.+)$") end
+  end
+  if not raw_token then return nil end
+
+  local payload_b64 = raw_token:match("^[^%.]+%.([^%.]+)%.")
+  if not payload_b64 then return nil end
+
+  local padded = payload_b64:gsub("%-", "+"):gsub("_", "/")
+  padded = padded .. string.rep("=", (4 - (#padded % 4)) % 4)
+  local json_str = ngx.decode_base64(padded)
+  if not json_str then return nil end
+
+  local ok, claims = pcall(cjson.decode, json_str)
+  if ok and type(claims) == "table" then return claims end
+  return nil
+end
+
+local function resolve_user_name(headers, body, log_prefix, debug)
+  if headers["x-user-name"] then return headers["x-user-name"] end
+  local claims = decode_jwt_claims(headers, log_prefix, debug)
+  if claims then
+    local user = claims.email or claims.preferred_username
+                 or claims["cognito:username"] or claims.sub
+    if type(user) == "string" and user ~= "" then
+      if debug then
+        kong.log.debug(log_prefix, " user from JWT: ", user)
+      end
+      return user
+    end
+  end
+  if body and type(body.user) == "string" and body.user ~= "" then
+    return body.user
+  end
+  return "kong"
+end
+
+local function parse_sse_chunks(buf)
+  local chunks = {}
+  local current_event = nil
+  local data_lines = {}
+
+  local function flush_chunk()
+    if #data_lines == 0 and not current_event then return end
+
+    local data = table.concat(data_lines, "\n")
+    local chunk = {}
+    if current_event then chunk.event = current_event end
+    if data ~= "" then
+      local ok, decoded = pcall(cjson.decode, data)
+      chunk.data = ok and decoded or data
+    end
+    chunks[#chunks + 1] = chunk
+
+    current_event = nil
+    data_lines = {}
+  end
+
+  local normalized = buf:gsub("\r\n", "\n"):gsub("\r", "\n")
+  for line in (normalized .. "\n"):gmatch("([^\n]*)\n") do
+    if line == "" then
+      flush_chunk()
+    else
+      local event = line:match("^event:%s*(.*)$")
+      if event then
+        current_event = event
+      else
+        local data = line:match("^data:%s*(.*)$")
+        if data then
+          data_lines[#data_lines + 1] = data
+        end
+      end
+    end
+  end
+
+  return chunks
+end
+
+local function block_payload(_, model)
+  return 200, {
+    id      = "chatcmpl-blocked",
+    object  = "chat.completion",
+    model   = model or "unknown",
+    choices = {{
+      index         = 0,
+      message       = { role = "assistant", content = "I'm sorry, I'm unable to process that request." },
+      finish_reason = "stop",
+    }},
+  }
+end
+
+local function read_original_body()
+  local ai_ctx = ngx.ctx.ai_namespaced_ctx
+  if ai_ctx and ai_ctx._global and type(ai_ctx._global.request_body) == "string" then
+    local raw = ai_ctx._global.request_body
+    if raw ~= "" then return raw, true end
+  end
+  return nil, false
+end
+
+local function build_webhook_payload(opts, log_prefix)
+  local headers = opts.headers or {}
+  local debug = opts.conf and opts.conf.debug
+  local user_id = resolve_user_name(headers, opts.body, log_prefix, debug)
+  local user_role = headers["x-user-role"] or "public"
+
+  local consumer_block = {}
+  local ok, consumer = pcall(function() return kong.client.get_consumer() end)
+  if ok and consumer then
+    consumer_block.id        = consumer.id
+    consumer_block.username  = consumer.username
+    consumer_block.custom_id = consumer.custom_id
+  end
+
+  local ai_ctx_out = nil
+  local ai_ctx = ngx.ctx.ai_namespaced_ctx
+  if ai_ctx and type(ai_ctx) == "table" then
+    local mc = ai_ctx["merge-models-conf"]
+    local conf = mc and mc.model_conf
+    if conf then
+      ai_ctx_out = {
+        llm_format      = conf.llm_format,
+        route_type      = conf.route_type,
+        genai_category  = conf.genai_category,
+        model           = conf.model,
+      }
+    end
+  end
+
+  local payload = {
+    eventType   = opts.event_type,
+
+    request = {
+      body = opts.body,
+      text = opts.prompt,
+    },
+
+    userInfo = {
+      id   = user_id,
+      role = user_role,
+    },
+
+    consumer = consumer_block,
+
+    metadata = {
+      session_id = headers["x-session-id"] or ngx.var.request_id or "kong-session",
+      client_ip  = ngx.var.remote_addr or "127.0.0.1",
+    },
+
+    aiContext = ai_ctx_out,
+  }
+
+  return payload
+end
+
+local function add_webhook_response(webhook_payload, resp_body, app_response)
+  webhook_payload.response = {
+    stream = false,
+    body = resp_body,
+    text = app_response,
+  }
+  return webhook_payload
+end
+
+local function add_webhook_stream_response(webhook_payload, chunks)
+  webhook_payload.response = {
+    stream = true,
+    chunks = chunks,
+    text = cjson.null,
+  }
+  return webhook_payload
+end
+
+-- ---------------------------------------------------------------------------
+-- Transport
+-- ---------------------------------------------------------------------------
 
 local function webhook_url(conf)
   local url = (conf.detect_url or "https://api.prod.straiker.ai/api/v1/detect/webhook"):gsub("%?.*$", "")
@@ -97,7 +321,7 @@ function StraikerHandler:access(conf)
   kong.service.request.enable_buffering()
   kong.service.request.set_header("Accept-Encoding", "identity")
 
-  local raw, from_ai = helpers.read_original_body()
+  local raw, from_ai = read_original_body()
   if conf.debug and from_ai then
     kong.log.notice(LOG_PREFIX, " using original request body from ai-proxy context")
   end
@@ -109,7 +333,7 @@ function StraikerHandler:access(conf)
   local body = cjson.decode(raw)
   if not body then return end
 
-  local prompt = helpers.last_user_prompt(body.messages)
+  local prompt = last_user_prompt(body.messages)
   if prompt == "" then return end
 
   if conf.debug then
@@ -120,7 +344,7 @@ function StraikerHandler:access(conf)
   kong.ctx.plugin.model = body.model
   kong.ctx.plugin.headers = ngx.req.get_headers()
 
-  local webhook = helpers.build_webhook_payload({
+  local webhook = build_webhook_payload({
     conf = conf,
     body = body,
     prompt = prompt,
@@ -161,7 +385,7 @@ function StraikerHandler:access(conf)
 
   if should_block(conf, result) then
     kong.ctx.plugin.blocked = true
-    local status, payload_tbl = helpers.block_payload(conf, kong.ctx.plugin.model)
+    local status, payload_tbl = block_payload(conf, kong.ctx.plugin.model)
     return kong.response.exit(status, payload_tbl)
   end
 end
@@ -196,7 +420,7 @@ function StraikerHandler:response(conf)
   local app_response, has_tool_calls = "", false
   local stream_chunks = nil
   if is_sse then
-    stream_chunks = helpers.parse_sse_chunks(raw_body)
+    stream_chunks = parse_sse_chunks(raw_body)
   else
     local resp = cjson.decode(raw_body)
     if resp and resp.choices and resp.choices[1] and resp.choices[1].message then
@@ -227,9 +451,9 @@ function StraikerHandler:response(conf)
   if kong.ctx.plugin.webhook then
     webhook.eventType = "post_call"
     if is_sse then
-      helpers.add_webhook_stream_response(webhook, stream_chunks or {})
+      add_webhook_stream_response(webhook, stream_chunks or {})
     else
-      helpers.add_webhook_response(webhook, resp_body, app_response)
+      add_webhook_response(webhook, resp_body, app_response)
     end
     if conf.debug then
       kong.log.notice(LOG_PREFIX, " webhook post_call: ", cjson.encode(webhook))
@@ -260,7 +484,7 @@ function StraikerHandler:response(conf)
 
   if should_block(conf, result) then
     kong.log.notice(LOG_PREFIX, " BLOCKING response action=", tostring(result.action))
-    local status, payload_tbl = helpers.block_payload(conf, kong.ctx.plugin.model)
+    local status, payload_tbl = block_payload(conf, kong.ctx.plugin.model)
     return kong.response.exit(status, payload_tbl)
   end
 end
