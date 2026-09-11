@@ -1,13 +1,16 @@
 -- Config schema for straiker-coding-agent-buffered.
 --
--- SELF-CONTAINED BY REQUIREMENT. Konnect hybrid rejects a schema that
--- require()s anything, including typedefs. The handler is free to require
--- shared modules; this file is not.
+-- SELF-CONTAINED BY REQUIREMENT. Konnect rejects a schema that require()s
+-- anything, including kong.db.schema.typedefs, and Kong streaming custom
+-- plugins ship only handler.lua and schema.lua. The protocols field below
+-- is the expansion of typedefs.protocols_http: constants.PROTOCOLS_WITH_
+-- SUBSYSTEM filtered to subsystem "http" and sorted.
 --
 -- The shared field block is duplicated with straiker-coding-agent-streaming.
--- Keep the two copies byte-identical when you edit either.
+-- Keep the two copies byte-identical: tools/check-shared-blocks.sh fails
+-- when they drift.
 
--- >>> SHARED BLOCK -- keep byte-identical with straiker-coding-agent-streaming <<<
+-- >>> BEGIN SHARED FIELDS <<<
 local shared_fields = {
   { detect_url = {
       type = "string", match = "^https?://",
@@ -31,7 +34,7 @@ local shared_fields = {
       description = "Skip response scoring above this size, in bytes.",
   } },
 }
--- >>> END SHARED BLOCK <<<
+-- >>> END SHARED FIELDS <<<
 
 return {
   name = "straiker-coding-agent-buffered",

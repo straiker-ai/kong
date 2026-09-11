@@ -1,9 +1,21 @@
-local typedefs = require "kong.db.schema.typedefs"
+-- Config schema for straiker.
+--
+-- SELF-CONTAINED BY REQUIREMENT. Konnect rejects a schema that require()s
+-- anything, including kong.db.schema.typedefs, and Kong streaming custom
+-- plugins ship only handler.lua and schema.lua. The protocols field below
+-- is the expansion of typedefs.protocols_http: constants.PROTOCOLS_WITH_
+-- SUBSYSTEM filtered to subsystem "http" and sorted. The handler is free
+-- to require third-party modules; this file is not.
 
 return {
   name = "straiker",
   fields = {
-    { protocols = typedefs.protocols_http },
+    { protocols = {
+        type = "set", required = true,
+        default = { "grpc", "grpcs", "http", "https" },
+        elements = { type = "string",
+                     one_of = { "grpc", "grpcs", "http", "https" } },
+    } },
     { config = {
         type = "record",
         fields = {

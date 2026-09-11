@@ -39,11 +39,27 @@ decK `${{ env "DECK_STRAIKER_API_KEY" }}` writes the literal at apply time. Fine
 
 POST each coding-agent `schema.lua` once. Update with PUT on the plugin name (`POST` fails with a unique-name constraint once the schema exists). A schema update does not reconcile to data planes until some other config change forces a payload — touch an entity and verify.
 
-Cloud Gateways refuse custom plugins (`400 custom plugins are not supported in Cloud Gateways`). Inline `pre-function` cannot call Straiker Defend (`resty.http` is sandboxed).
+## Dedicated Cloud Gateways
+
+Dedicated Cloud Gateways now stream the whole plugin from the control plane (Gateway 3.15+), so there is nothing to install on a data plane — you POST `handler.lua` and `schema.lua` together to `core-entities/custom-plugins`. See [Install → Konnect Dedicated Cloud Gateways](../README.md#konnect-dedicated-cloud-gateways).
+
+Three consequences for these plugins specifically.
+
+**A streamed plugin is only those two files.** Nothing else is on the data plane's Lua path, so a handler that requires a sibling module dies at load with `handler load failure … module 'kong.plugins.straiker.…' not found`, and the whole declarative config is rejected — not just that plugin. Both coding-agent handlers are self-contained; `tools/check-shared-blocks.sh` keeps the duplicated regions in step.
+
+**`require` is gated by `KONG_UNTRUSTED_LUA`.** This is the setting to get right, and it is settable per gateway at creation time. Kong's default is `strict`, which allows no network module, so the handler fails at load with `require("resty.http") not allowed within sandbox` and takes the config down with it. `lax` allowlists `resty.http` and `cjson.safe`; `on` is unrestricted. Both work. Do not confuse this failure with the module-not-found above: that one lists every path Lua searched, this one never reaches the search.
+
+**Timers are documented as unavailable, but are not actually blocked.** `straiker-coding-agent-streaming` relays the model's response from `ngx.timer.at`, because `log_by_lua` forbids cosockets and `resty.http` needs them — there is no alternative once the bytes have shipped. Kong's sandbox nevertheless hands a plugin the entire `ngx` global in every mode (`kong/tools/sandbox/configuration.lua`, commented "including timers, :-("), so read the restriction as a request not to rather than a wall: a timer outlives the request holding a closure over plugin config, which is a hazard when the control plane hot-swaps streamed code.
+
+If a spawn is ever refused, the plugin logs `relay timer spawn failed` and continues — requests are still inspected and still blocked. The loss is smaller than it looks, because the client replays the assistant message (including `tool_use` blocks) in the next request, which `access` already forwards; what is actually missed is the final turn of a session and the SSE-only metadata. To drop the relay deliberately set `relay_response: false`, or use `straiker-coding-agent-buffered`, which scores the response inline in the `response` phase and needs no timer.
+
+Konnect **Serverless** gateways still refuse custom plugins outright. Inline `pre-function` is not a workaround there: under `strict` it cannot require `resty.http`, so it cannot call Straiker Defend.
 
 ## Identity
 
-Claude Code sends no user identity. If the route already has `key-auth`, JWT, mTLS, or OIDC, the plugin forwards the Kong consumer as `x-straiker-user`. Otherwise turns are unattributed.
+Claude Code sends no user identity. If the route already has `key-auth`, JWT, mTLS, or OIDC, the plugin forwards the Kong consumer as `x-straiker-user`.
+
+Without an auth plugin, turns are **not** unattributed — they are attributed to whatever the client claims. `resolve_user()` falls back to the request's own `x-consumer-username` header, which nothing on an unauthenticated route sets but the caller, so `curl -H 'x-consumer-username: someone.else@example.com'` lands that string in Straiker as the acting user. Treat attribution on an unauthenticated route as a hint, never as evidence, and put an auth plugin on any route where it needs to hold.
 
 Do **not** put a per-developer key in `x-api-key` — Claude subscription users send `Authorization: Bearer` and no `x-api-key`. Use a dedicated header (for example `apikey`) and `hide_credentials: true` so that key is not forwarded upstream.
 

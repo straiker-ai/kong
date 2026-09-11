@@ -1,0 +1,50 @@
+name: Plugin layout
+
+# The three plugins ship as streaming custom plugins, so each is exactly one
+# handler.lua and one schema.lua with no sibling modules. Nothing at runtime
+# re-checks that, and a drift between the two coding-agent handlers would be
+# silent: a route would be protected or not depending on which variant it uses.
+# This workflow is what catches both.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  layout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shared blocks in sync, layout streamable
+        run: ./tools/check-shared-blocks.sh
+
+      - name: Install LuaJIT
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends luajit
+
+      - name: Syntax-check every plugin file
+        run: |
+          fail=0
+          for f in $(find kong -name '*.lua' | sort); do
+            if luajit -bl "$f" >/dev/null 2>/tmp/err; then
+              echo "ok      $f"
+            else
+              echo "SYNTAX  $f"; cat /tmp/err; fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Each plugin fits the 100 KB per-file upload limit
+        run: |
+          fail=0
+          for f in kong/plugins/*/handler.lua kong/plugins/*/schema.lua; do
+            bytes=$(wc -c < "$f")
+            if [ "$bytes" -gt 102400 ]; then
+              echo "TOO BIG $f ($bytes bytes > 102400)"; fail=1
+            else
+              echo "ok      $f ($bytes bytes)"
+            fi
+          done
+          exit $fail
