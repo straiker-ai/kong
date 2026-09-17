@@ -244,7 +244,7 @@ curl -i -X POST \
 | `max_body_bytes` | No | `10485760` | Skip scoring above this size. |
 | `upstream_api_key` | No | | Model credential the gateway holds, injected on the way out. Vault-referenceable. |
 | `upstream_key_header` | No | `x-api-key` | Header carrying it. Use `authorization` for OpenAI-style providers. |
-| `user_ref` | No | | Attribution for turns on this route. Vault-referenceable. |
+| `user_ref` | No | | Fallback attribution, used only when no Kong Consumer is resolved. Vault-referenceable. |
 | `session_from_body` | No | `true` | Derive a stable session id when the client sends no session header. |
 | `debug_preamble` | No | `false` | Log the system-prompt shape to explain client resolution. Prints prompt content to the Kong log. |
 | `client` | No | | Names the client on a single-application route. Leave unset on a shared gateway. |
@@ -314,10 +314,10 @@ Inline images and PDFs increase request size because they are base64 encoded. Ra
 - `streaming` mode cannot stop a tool call before it runs; `buffered` mode makes time to first token equal to the completion time.
 - `buffered` mode is incompatible with AI Proxy on streaming requests.
 - Synchronous scoring adds latency to the request path.
-- Attribution is per route: `user_ref` is a static value and is not derived from the Kong Consumer.
 
 ## Security considerations
 
+- Attribution follows the route's authentication. The plugin reads the Kong Consumer when one is resolved and falls back to the static `user_ref` otherwise; it never reads an identity header from the client. Put an authentication plugin on any route whose attribution you rely on.
 - Store `api_key` and `upstream_api_key` as Kong Vault references. Both fields are vault-referenceable.
 - Keep `debug_preamble` false in production; it writes prompt content to the node's error log.
 - Use TLS egress to Straiker.
