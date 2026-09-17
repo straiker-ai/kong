@@ -40,7 +40,40 @@
 local cjson = require "cjson.safe"
 local http  = require "resty.http"
 
-local Straiker = { PRIORITY = 1000, VERSION = "0.12.0" }
+-- ⚠️ **760 is deliberate, and it is below ai-proxy (770) on purpose.**
+--
+-- ai-proxy switches Kong's response buffering off whenever the client streams,
+-- and coding agents always stream. Kong's plugins iterator sets
+-- `ctx.buffered_proxying` when it COLLECTS a plugin declaring `response`, and
+-- collection is interleaved with access execution in descending priority order.
+-- So the last plugin to touch the flag wins:
+--
+--   at 1000  we set it -> ai-proxy clears it -> nothing restores it.
+--            `response` never runs. The answer is never scored, the client still
+--            gets 200 with an `allow` verdict, and nothing says enforcement
+--            stopped. Measured: request-phase call only, no `response-sync`.
+--   at 760   ai-proxy clears it -> we are collected after and it is set again.
+--            `response` runs. Measured: request + `response-sync`, and the
+--            captured body is still the client's own Anthropic request.
+--
+-- Still far below Kong auth (key-auth 1250, jwt 1450), so the Consumer is
+-- resolved before `access` and attribution is unaffected.
+--
+-- The cost is ordering, on BOTH halves of the request:
+--
+--   request   we now sit after request-transformer (801) and after any ai-proxy
+--             rewrite, so `get_raw_body()` is whatever ai-proxy produced rather
+--             than guaranteed to be the client's own.
+--   response  in `streaming` mode our `body_filter` now runs after ai-proxy's
+--             SSE normalizer, so the relayed bytes are its output rather than
+--             the raw upstream stream.
+--
+-- On an Anthropic-to-Anthropic route -- the documented coding-agent topology --
+-- both rewrites are pass-throughs and the bytes are unchanged; verified against
+-- a captured request and a captured relay. A provider where ai-proxy genuinely
+-- reshapes the traffic would hand us its translation on both halves. If the raw
+-- client bytes must be guaranteed, keep ai-proxy off that route.
+local Straiker = { PRIORITY = 760, VERSION = "0.12.0" }
 
 -- Read ONCE, at module load. See the header for why this cannot be config.
 local MODE = os.getenv("STRAIKER_KONG_MODE")
@@ -185,7 +218,7 @@ end
 -- Messages body. Verified rather than assumed.
 -- Who the turn is about.
 --
--- The Kong Consumer first. This plugin's priority (1000) sits below the auth plugins
+-- The Kong Consumer first. This plugin's priority (760) sits below the auth plugins
 -- (key-auth 1250, jwt 1450), so on an authenticated route the consumer is already
 -- resolved by the time `access` runs and it names the actual caller rather than the
 -- route. `user_ref` is the static per-route fallback for routes with no auth.
