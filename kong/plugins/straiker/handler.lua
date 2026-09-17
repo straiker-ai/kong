@@ -183,12 +183,39 @@ end
 -- Adding these does not change how the payload is classified: neither field is a
 -- format discriminator, so a Messages body enriched this way is still read as a
 -- Messages body. Verified rather than assumed.
+-- Who the turn is about.
+--
+-- The Kong Consumer first. This plugin's priority (1000) sits below the auth plugins
+-- (key-auth 1250, jwt 1450), so on an authenticated route the consumer is already
+-- resolved by the time `access` runs and it names the actual caller rather than the
+-- route. `user_ref` is the static per-route fallback for routes with no auth.
+--
+-- ⚠️ **There is deliberately no `x-consumer-username` fallback.** Reading that header
+-- when no consumer resolves means that on an UNAUTHENTICATED route the caller picks
+-- the name recorded against their own traffic -- `curl -H 'x-consumer-username: …'`
+-- is the whole attack. An unauthenticated route has no identity to report, so the
+-- honest answer there is `user_ref` or nothing.
+--
+-- Safe in every phase this is reached from: `access` for the prompt, `response` or
+-- `log` for the answer. The streaming relay builds its payload in `log`, before the
+-- timer, precisely because `kong.client` does not exist inside one.
+local function acting_user(conf)
+  local get_consumer = kong.client and kong.client.get_consumer
+  local consumer = get_consumer and get_consumer()
+  if consumer and consumer.username and consumer.username ~= "" then
+    return consumer.username
+  end
+  return conf.user_ref
+end
+
 local function with_identity(conf, ctx, payload)
   if ctx.straiker_session then payload.session_id = ctx.straiker_session end
-  if conf.user_ref then
-    -- The one place Straiker looks for a user on a relayed request. Nothing else on
-    -- this path can supply one, so without it turns are attributed to nobody.
-    payload.original = { processed = { Meta = { user = conf.user_ref } } }
+  local user = acting_user(conf)
+  if user then
+    -- The one place Straiker looks for a user on a relayed request: v3 has no user
+    -- header at all, so the body is the only place a caller can name one. Without it
+    -- turns are attributed to nobody.
+    payload.original = { processed = { Meta = { user = user } } }
   end
   return payload
 end

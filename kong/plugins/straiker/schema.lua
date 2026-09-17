@@ -120,13 +120,19 @@ return {
       -- Both are added to the DETECT payload only. The body forwarded upstream is
       -- untouched, so the model never sees them.
       { user_ref = {
+          -- The FALLBACK, not the primary. An authenticated Kong Consumer wins: the
+          -- handler reads `kong.client.get_consumer()` first, so a route behind
+          -- key-auth/JWT/mTLS/OIDC attributes each turn to the actual caller and this
+          -- field is only reached when no consumer resolved. Set it on routes with no
+          -- auth, where the honest answer is the integration rather than a person.
+          --
           -- ⚠️ `referenceable`, and it was MISSED here once. Without it Kong passes
           -- `{vault://env/straiker-user}` through verbatim and that literal string is
           -- archived as the turn's subject -- the same failure this file already
           -- documents for request-transformer, reproduced in our own schema. Any field
           -- that a `.env` value reaches has to carry this flag.
           type = "string", referenceable = true,
-          description = "Who to attribute turns to, e.g. user@example.com. Prefer gateway identity.",
+          description = "Fallback attribution when no Kong Consumer is resolved, e.g. user@example.com.",
       } },
       { session_from_body = {
           -- A digest of the preamble plus the first user message. Stable across the

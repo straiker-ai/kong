@@ -50,7 +50,13 @@ The alternative is pass-through: set no `upstream_api_key` and let each develope
 
 ## Attribution
 
-`user_ref` is a **static per-route value**. The plugin does not read the Kong Consumer and does not derive a user from any client header, so every turn on a route is attributed to that route's `user_ref`. No client can forge it, and equally no client can distinguish itself — per-developer attribution means one route per developer.
+The plugin reads the **Kong Consumer** first. Its priority (1000) sits below the auth plugins (`key-auth` 1250, `jwt` 1450), so on an authenticated route the consumer is already resolved and each turn names the actual caller. That is how you get per-developer attribution from a shared gateway: put an auth plugin on the route and give each developer a credential.
+
+`user_ref` is the **fallback**, reached only when no consumer resolved. On a route with no auth it is the honest answer — it names the integration, not a person.
+
+There is deliberately no `x-consumer-username` header fallback. Reading that header when no consumer resolves would mean that on an unauthenticated route the caller chooses the name recorded against their own traffic; `curl -H 'x-consumer-username: someone.else@example.com'` is the whole attack. Attribution on an unauthenticated route is a label, never evidence.
+
+Do **not** put a per-developer key in `x-api-key` — Claude subscription users send `Authorization: Bearer` and no `x-api-key`. Use a dedicated header such as `apikey` with `hide_credentials: true`, so the key identifies the developer to Kong without being forwarded upstream.
 
 Sessions are different: `x-claude-code-session-id` is used when the client sends it, and otherwise `session_from_body` derives a stable digest from the system preamble plus the first user message. Both are stable across the turns of one conversation, because a transcript grows at the end.
 

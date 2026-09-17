@@ -112,7 +112,7 @@ Declare `protocols: ["http", "https"]` on each route. With no `protocols`, Kong 
 | `max_body_bytes` | No | `10485760` | Skip scoring above this size |
 | `upstream_api_key` | No | — | Model credential the **gateway** holds, injected on the way out. Vault-referenceable |
 | `upstream_key_header` | No | `x-api-key` | Header to carry it. `x-api-key` for Anthropic, `authorization` for OpenAI-style |
-| `user_ref` | No | — | Who to attribute turns to. A relayed body carries no user, so without this every turn is an unknown user. Vault-referenceable |
+| `user_ref` | No | — | Fallback attribution, used only when no Kong Consumer is resolved. On an authenticated route the Consumer wins. Vault-referenceable |
 | `session_from_body` | No | `true` | Derive a stable session id when the client sends no header |
 | `debug_preamble` | No | `false` | Log the system-prompt shape and lead, to explain client resolution. **Prints prompt content to the Kong log** |
 | `client` | No | — | Optional `x-s6r-client`. Leave unset on a shared gateway; set it on a single-app route |
@@ -472,7 +472,7 @@ A system prompt only names a client Straiker has a marker for; anything unrecogn
 
 ## Security considerations
 
-- **Attribution is per route, not per caller.** `user_ref` is a static configuration value, and the plugin does not derive a user from the Kong Consumer or from any client header. Every turn on a route is therefore attributed to that route's `user_ref`. Per-developer attribution needs one route per developer; otherwise treat the attribution as naming the integration, not the person. The upside is that no client header can forge it.
+- **Attribution is only as trustworthy as the route's auth.** On an authenticated route the plugin reads the Kong Consumer, so each turn names the actual caller. With no auth plugin there is no caller to name and it falls back to the static `user_ref`, which identifies the integration rather than a person. The plugin deliberately does **not** read an `x-consumer-username` request header: on an unauthenticated route that would let a caller choose the name recorded against their own traffic. Put `key-auth`, JWT, mTLS, or OIDC on any route whose attribution you intend to rely on.
 - Store `api_key` and `upstream_api_key` in a Kong vault. Both fields are referenceable; `request-transformer`'s headers are not, which is why the upstream credential belongs here.
 - **`debug_preamble: true` writes prompt content to the node's error log**, where anyone with log access can read it and log shipping will retain it. Use it to validate an install, then turn it off.
 - Alert on `x-straiker-verdict: degraded` and `unknown` so a degraded control is visible. Neither shows up as an HTTP error.
