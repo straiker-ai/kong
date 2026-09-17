@@ -4,20 +4,20 @@
 
 As teams route more of their builder and agent traffic through Kong AI Gateway, Straiker Defend secures it. One plugin on the route, and every AI call is checked and blocked at the gateway, with no SDK in your apps.
 
-There are two shapes of traffic, and a plugin for each:
+There are two shapes of traffic, and one plugin covers both:
 
 | | Chat applications | Coding agents (Claude Code and similar) |
 | --- | --- | --- |
-| Plugin | `straiker` | `straiker-coding-agent-streaming` or `straiker-coding-agent-buffered` |
-| What you stop | Prompt injection, data leakage, unsafe output | Prompts, poisoned tool results, and (buffered) tool calls before they run |
+| Plugin | `straiker` | `straiker` |
+| What you stop | Prompt injection, data leakage, unsafe output | Prompts, poisoned tool results, and — in buffered mode — tool calls before they run |
 
-Pick the plugin in the [README](../README.md). The rest of this page is the security value of putting Straiker Defend on Kong.
+The plugin runs in one of two delivery modes, set per Kong node by `STRAIKER_KONG_MODE`. See [Delivery mode](../README.md#delivery-mode). The rest of this page is the security value of putting Straiker on Kong.
 
 ## Coding agents on the gateway
 
 Tools run on the developer laptop, but every model call crosses the gateway — so Kong is a single control point for agent traffic, with nothing to install on developer machines. It also sees activity that endpoint instrumentation can miss: tool calls that fail, and `@`-mention file reads that never become a tool call.
 
-Use **streaming** on interactive developer routes. Use **buffered** on CI and unattended agents when a denied `Bash` / `Write` must never reach the client.
+Use **streaming** mode for interactive developers. Use **buffered** mode on CI and unattended agents, where a denied `Bash` or `Write` must never reach the client. The mode is a node-level setting, so the two run on separate node pools.
 
 ```mermaid
 flowchart LR
