@@ -1,10 +1,10 @@
 name: Plugin layout
 
-# The three plugins ship as streaming custom plugins, so each is exactly one
-# handler.lua and one schema.lua with no sibling modules. Nothing at runtime
-# re-checks that, and a drift between the two coding-agent handlers would be
-# silent: a route would be protected or not depending on which variant it uses.
-# This workflow is what catches both.
+# The plugin ships as a streaming custom plugin, so it is exactly one
+# handler.lua and one schema.lua with no sibling modules and no require() in the
+# schema. Nothing at runtime re-checks that, and a violation only surfaces on a
+# Konnect Dedicated Cloud Gateway upload — the furthest possible point from the
+# change that caused it. This workflow is what catches it here instead.
 
 on:
   push:
@@ -18,8 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Shared blocks in sync, layout streamable
-        run: ./tools/check-shared-blocks.sh
+      - name: Layout streamable
+        run: ./tools/check-plugin-layout.sh
 
       - name: Install LuaJIT
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends luajit
