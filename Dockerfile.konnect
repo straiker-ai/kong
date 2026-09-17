@@ -1,13 +1,21 @@
-FROM kong/kong-gateway:3.14
+FROM kong/kong-gateway:3.15
 USER root
 COPY kong/plugins/straiker/ /usr/local/share/lua/5.1/kong/plugins/straiker/
-COPY kong/plugins/straiker-coding-agent-buffered/ /usr/local/share/lua/5.1/kong/plugins/straiker-coding-agent-buffered/
-COPY kong/plugins/straiker-coding-agent-streaming/ /usr/local/share/lua/5.1/kong/plugins/straiker-coding-agent-streaming/
 USER kong
-ENV KONG_PLUGINS=bundled,straiker,straiker-coding-agent-buffered,straiker-coding-agent-streaming
-# Required by the coding-agent plugins. At nginx's 8k default a Claude Code body
-# (138 KB typical, >1 MB with a large tool set) spills to a temp file,
-# get_raw_body() returns nil, and traffic proxies UNINSPECTED with a 200 and
-# x-straiker-verdict: fail-open-no-body. Harmless for chat-only deployments.
+ENV KONG_PLUGINS=bundled,straiker
+
+# Delivery mode, node-wide. `buffered` holds the model's answer until Straiker
+# has scored it, so a violating tool_use never reaches the client; `streaming`
+# ships tokens untouched and relays the answer afterwards.
+#
+# It is an environment variable and not a config field because Kong refuses a
+# plugin implementing both `response` and `body_filter` and inspects the handler
+# table at load time. A node therefore serves one mode, and changing it is a
+# restart. Run two node pools if you need both.
+ENV STRAIKER_KONG_MODE=buffered
+
+# Required. At nginx's 8k default a Claude Code body (138 KB typical, >1 MB with
+# a large tool set) spills to a temp file, get_raw_body() returns nil, and
+# traffic proxies UNINSPECTED with a 200 and a fail-open verdict header.
 ENV KONG_NGINX_HTTP_CLIENT_BODY_BUFFER_SIZE=32m
 ENV KONG_NGINX_HTTP_CLIENT_MAX_BODY_SIZE=64m
