@@ -50,7 +50,7 @@ The alternative is pass-through: set no `upstream_api_key` and let each develope
 
 ## Attribution
 
-The plugin reads the **Kong Consumer** first. Its priority (1000) sits below the auth plugins (`key-auth` 1250, `jwt` 1450), so on an authenticated route the consumer is already resolved and each turn names the actual caller. That is how you get per-developer attribution from a shared gateway: put an auth plugin on the route and give each developer a credential.
+The plugin reads the **Kong Consumer** first. Its priority (760) sits below the auth plugins (`key-auth` 1250, `jwt` 1450), so on an authenticated route the consumer is already resolved and each turn names the actual caller. That is how you get per-developer attribution from a shared gateway: put an auth plugin on the route and give each developer a credential.
 
 `user_ref` is the **fallback**, reached only when no consumer resolved. On a route with no auth it is the honest answer — it names the integration, not a person.
 
