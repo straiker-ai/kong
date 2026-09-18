@@ -9,7 +9,7 @@ This repository ships **one plugin**: `straiker`. It speaks Anthropic Messages a
 | | |
 | --- | --- |
 | Plugin name | `straiker` |
-| Priority | 1000 — above AI Proxy (770), below Kong auth (`key-auth` 1250, `jwt` 1450) |
+| Priority | 760 — below AI Proxy (770) so buffering survives it, below Kong auth (`key-auth` 1250, `jwt` 1450) |
 | Straiker API | `POST /api/v3/detect` |
 | Phases | `access` always; then `response` (buffered) or `body_filter` + `log` (streaming) |
 | Files | `handler.lua` + `schema.lua`, nothing else |
@@ -216,22 +216,22 @@ Or `KONG_NGINX_HTTP_CLIENT_BODY_BUFFER_SIZE=32m`. Raise `nginx_http_client_max_b
 
 ## AI Proxy
 
-**Do not put `ai-proxy` in front of a node running `STRAIKER_KONG_MODE=buffered`.**
+`ai-proxy` may be attached to the same route. This is what the plugin's priority of **760** buys, and it is the reason the number is below AI Proxy's 770 rather than above it.
 
-AI Proxy turns Kong's response buffering off whenever the client streams, so the plugin's `response` phase never runs. Coding agents always stream. Enforcement stops with no error and the response still carries an allow verdict, which makes this the hardest kind of misconfiguration to notice.
+AI Proxy turns Kong's response buffering off whenever the client streams, and coding agents always stream. Kong's plugins iterator sets `ctx.buffered_proxying` when it *collects* a plugin declaring `response`, and collection is interleaved with access execution in descending priority order — so whichever plugin touches the flag last decides the outcome.
 
-The behaviour is in `kong/llm/plugin/base.lua` on Gateway 3.12 and 3.15, and is intentional on Kong's side — AI Proxy's streaming path is not designed to run behind a buffered response. It is not a bug to report; it is a combination to avoid.
+Measured, same request, differing only in this plugin's priority:
 
-Measured with the same request and the same deny verdict, differing only in whether AI Proxy is attached:
+| Priority | Buffering survives AI Proxy | Detect calls sent | Answer scored |
+| --- | --- | --- | --- |
+| 1000 (above AI Proxy) | no | request only | **no** |
+| 760 (below AI Proxy) | yes | request + `response-sync` | yes |
 
-| Route | Time to first byte | `response` phase ran | `tool_use` delivered | Verdict |
-| --- | --- | --- | --- | --- |
-| buffered | 1527 ms | yes | **0** | `block` |
-| buffered + `ai-proxy` | 10 ms | **no** | **1** | `allow` |
+At 1000 the failure is silent: the `response` phase never runs, the client still receives `200` with `x-straiker-verdict: allow`, and nothing reports that response-side enforcement stopped. At 760 the flag is re-set when this plugin is collected, after AI Proxy cleared it, and the response phase runs normally.
 
-A non-streaming client is unaffected — the clear is conditional on stream mode — but coding agents always stream.
+**What 760 costs.** The plugin now runs after `request-transformer` (801) and after any AI Proxy request rewrite. On an Anthropic-to-Anthropic coding-agent route that rewrite is a pass-through and the captured body is the client's own request, verified. On a provider where AI Proxy genuinely reshapes the request, this plugin would see the translated body rather than the original — so if you need the raw client body guaranteed, keep AI Proxy off that route.
 
-Options: drop `ai-proxy` from that route and let the plugin inject the upstream credential (`upstream_api_key`), or run that route in `streaming` mode, where AI Proxy is harmless. If you must keep both, a `post-function` at priority −1000 re-arms buffering after AI Proxy clears it — but that deliberately re-enters a path Kong disables on purpose, carries no support commitment, and is untested against providers where AI Proxy genuinely rewrites the SSE.
+A non-streaming client was never affected either way: the clear is conditional on stream mode.
 
 ---
 
@@ -464,7 +464,7 @@ A system prompt only names a client Straiker has a marker for; anything unrecogn
 - A streamed plugin needs `KONG_UNTRUSTED_LUA` set to `lax` or `on`.
 - The delivery mode is node-wide, not per-route.
 - `streaming` cannot stop a tool before it runs; `buffered` makes time to first token the completion time.
-- `buffered` is incompatible with `ai-proxy` on streaming requests — see [AI Proxy](#ai-proxy).
+- Running behind `ai-proxy` means this plugin sees the request AFTER any AI Proxy rewrite — see [AI Proxy](#ai-proxy).
 - Buffered responses spill to an nginx temp file on disk when they exceed the proxy buffers. That is model output at rest on the data plane; size `proxy_max_temp_file_size` and treat the node's filesystem accordingly.
 - Synchronous scoring adds a latency budget (default 8 s timeout, typically much faster).
 
