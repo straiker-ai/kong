@@ -84,6 +84,51 @@ Every response carries `x-straiker-verdict`:
 
 Alert on `degraded` and `unknown`. Both mean the control is not running while the traffic looks healthy.
 
+In `buffered` mode the header carries the answer's verdict, so a prompt verdict can be overwritten. The log record below keeps both.
+
+### The log record
+
+The plugin adds a `straiker` block to the log record Kong's log-serializing plugins write (file-log, http-log, tcp-log, udp-log, syslog, loggly, kafka-log, solace-log): the session once, then one entry per scored phase.
+
+```json
+"straiker": {
+  "session_id": "cc-session-113207",
+  "request":  { "action": "detect", "turn_id": "01a117a3-209a-718b-272e-92ea1466bba0",
+                "controls": ["ca_malicious_packages"], "blocked_by": [], "events_scored": 3 },
+  "response": { "action": "allow",  "turn_id": "01a117a3-23c8-761e-0675-46fd442e48d2",
+                "controls": [], "blocked_by": [], "events_scored": 1 }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `session_id` | The session Straiker filed the turns under |
+| `action` | Same as `x-straiker-verdict` for that phase: `allow`, `detect`, `block`, `degraded` or `unknown` |
+| `turn_id` | The Straiker turn, for looking it up in the console |
+| `controls` | Every control that fired, in detect or block mode |
+| `blocked_by` | The controls among them that blocked |
+| `events_scored` | Events Straiker scored on this call |
+
+- **A blocked prompt has no `response` entry**: the model was never called.
+- **A `degraded` phase carries only `action`.** Why it degraded is in the plugin's error-log line, `[straiker] request scoring failed: <reason>`.
+
+- **`streaming` mode records the prompt only.** The answer is scored after the response has been sent and logged, so a blocked answer is reported in the plugin's own log line instead: `[straiker] relay verdict was BLOCK but the answer had already streamed: <controls> (turn <turn_id>)`.
+- **The provider credential is masked.** The plugin injects `upstream_api_key` as a request header, and the record copies request headers, so the plugin replaces that header's value in the record with `REDACTED`.
+
+To log less, use the logging plugin's `custom_fields_by_lua`, which all of the plugins above support. Drop a field per phase with its dotted path, or drop the whole block:
+
+```yaml
+- name: http-log
+  config:
+    http_endpoint: https://logs.example.com/kong
+    custom_fields_by_lua:
+      straiker.request.events_scored: "return nil"    # one field, one phase
+      straiker.response.events_scored: "return nil"
+      # straiker: "return nil"                        # or the whole block
+```
+
+The setting only removes fields, so a field added in a later release appears until it is dropped too.
+
 ---
 
 ## Configure
@@ -291,7 +336,7 @@ docker build -f Dockerfile.konnect -t kong-straiker:latest .
 ### LuaRocks
 
 ```sh
-luarocks make kong-plugin-straiker-0.12.0-1.rockspec
+luarocks make kong-plugin-straiker-0.13.0-1.rockspec
 export KONG_PLUGINS=bundled,straiker
 kong reload
 ```
@@ -299,7 +344,7 @@ kong reload
 From a release (when published):
 
 ```sh
-luarocks install https://github.com/straiker-ai/kong/releases/download/v0.12.0/kong-plugin-straiker-0.12.0-1.all.rock
+luarocks install https://github.com/straiker-ai/kong/releases/download/v0.13.0/kong-plugin-straiker-0.13.0-1.all.rock
 ```
 
 ### Konnect hybrid
@@ -339,7 +384,7 @@ What Kong enforces on a streamed plugin, and what it means here:
 | --- | --- |
 | Only `handler.lua` and `schema.lua` | Met. A `require` of a sibling module fails at load |
 | `schema.lua` must not `require()` anything | Met. `typedefs.protocols_http` is expanded inline |
-| 100 KB per file | Met. The handler is ~29 KB, the schema ~10 KB |
+| 100 KB per file | Met. The handler is ~39 KB, the schema ~11 KB |
 | `require` is gated by `KONG_UNTRUSTED_LUA` | **The one setting that matters.** The handler needs `resty.http` and `cjson.safe`. See below |
 | Cannot create timers | Only relevant in `streaming` mode. See [Response relay and timers](#response-relay-and-timers) |
 | No filesystem reads or writes | Met. The plugin never touches the filesystem |
@@ -388,6 +433,17 @@ curl -i -X POST http://localhost:8000/v1/messages \
 ```
 
 You want HTTP 200 and `x-straiker-verdict: allow`. Keep `max_tokens` generous while testing: a reply truncated at `stop_reason: max_tokens` looks like a block at a glance.
+
+---
+
+## Upgrading from 0.12.x
+
+No config changes. What you will notice:
+
+- **`x-straiker-verdict` reports `detect`.** In 0.12.x a detect-mode finding read as `allow`. Anything alerting on the header sees the new value.
+- **The log record gains a `straiker` block.** See [The log record](#the-log-record). Every log-serializing plugin carries it; drop it with `custom_fields_by_lua` if you do not want it.
+- **The injected `upstream_api_key` is masked in the log record.** In 0.12.x any logging plugin received it in plain text with the request headers. If one was on, rotate that key.
+- **Derived session ids change.** They now seed on the first user message rather than `messages[1]`, and include the caller, so two users who open with the same words get separate sessions. A conversation that started under 0.12.x gets a new id after the upgrade. Requests carrying `x-claude-code-session-id` are unaffected.
 
 ---
 

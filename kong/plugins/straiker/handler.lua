@@ -73,7 +73,7 @@ local http  = require "resty.http"
 -- a captured request and a captured relay. A provider where ai-proxy genuinely
 -- reshapes the traffic would hand us its translation on both halves. If the raw
 -- client bytes must be guaranteed, keep ai-proxy off that route.
-local Straiker = { PRIORITY = 760, VERSION = "0.12.0" }
+local Straiker = { PRIORITY = 760, VERSION = "0.13.0" }
 
 -- Read ONCE, at module load. See the header for why this cannot be config.
 local MODE = os.getenv("STRAIKER_KONG_MODE")
@@ -253,6 +253,21 @@ local function with_identity(conf, ctx, payload)
   return payload
 end
 
+-- Every text block of a message, so a turn that opens with an image or a document
+-- still seeds on what the user wrote.
+local function message_text(m)
+  local c = m.content
+  if type(c) == "string" then return c end
+  if type(c) ~= "table" then return "" end
+  local parts = {}
+  for _, block in ipairs(c) do
+    if type(block) == "table" and type(block.text) == "string" then
+      parts[#parts + 1] = block.text
+    end
+  end
+  return table.concat(parts, "\n")
+end
+
 -- A session id for a conversation that states none.
 --
 -- The header first: Claude Code sends `x-claude-code-session-id` and it is the
@@ -272,30 +287,52 @@ local function conversation_id(conf, req)
     return req.session_id
   end
 
+  local msgs = req.messages or req.input
+  if type(msgs) ~= "table" then msgs = {} end
+
+  -- The preamble, wherever the API puts it: Anthropic's `system`, the Responses
+  -- API's `instructions`, or the leading system/developer message of an OpenAI
+  -- chat body.
   local system = req.system
   if type(system) == "table" then system = cjson.encode(system) end
-  -- `instructions` is the OpenAI Responses spelling of a preamble.
   if system == nil and type(req.instructions) == "string" then
     system = req.instructions
   end
-
-  -- ⚠️ **Three spellings of "the first thing the user said", because three request
-  -- contracts reach this plugin and seeding off only `messages` silently returned
-  -- nil for the other two.** A chat body (`{prompt}`) and an OpenAI Responses body
-  -- (`input`) both collapsed the seed to "\0", so every one of their turns was given
-  -- a fresh synthetic session and nothing grouped.
-  local first = ""
-  local msgs = req.messages or req.input
-  if type(msgs) == "table" and msgs[1] then
-    local c = msgs[1].content
-    if type(c) == "string" then first = c
-    elseif type(c) == "table" and c[1] then first = c[1].text or "" end
-  elseif type(req.prompt) == "string" then
-    first = req.prompt
+  if system == nil then
+    for _, m in ipairs(msgs) do
+      if type(m) == "table" and (m.role == "system" or m.role == "developer") then
+        system = message_text(m)
+        break
+      end
+    end
   end
 
-  local seed = tostring(system or "") .. "\0" .. tostring(first)
-  if seed == "\0" then return nil end
+  -- ⚠️ **The first USER message, never `messages[1]`.** An OpenAI chat body carries
+  -- its system prompt as `messages[1]`, so seeding off position alone made the seed
+  -- a constant per application: every conversation of that app, from every user,
+  -- landed in one session. Three request contracts reach this plugin, so a body
+  -- with no user message falls back to a string `input`, then to `prompt`.
+  local first
+  for _, m in ipairs(msgs) do
+    if type(m) == "table" and m.role == "user" then
+      first = message_text(m)
+      break
+    end
+  end
+  if first == nil then
+    if type(req.input) == "string" then first = req.input
+    elseif type(req.prompt) == "string" then first = req.prompt
+    else first = "" end
+  end
+
+  if (system or "") == "" and first == "" then return nil end
+
+  -- ⚠️ **The caller is part of the seed.** Straiker skips a turn it has already
+  -- scored in the same session, so two users who open with the same words must not
+  -- share one: hashed on the words alone, the second user's copy of a blocked
+  -- prompt comes back as a replay and is allowed.
+  local seed = tostring(acting_user(conf) or "") .. "\0" .. tostring(system or "")
+               .. "\0" .. first
   return "kong-" .. ngx.md5(seed)
 end
 
@@ -369,6 +406,16 @@ local function decision_of(verdict)
   return present(verdict.action)
 end
 
+-- ⚠️ **On the gateway envelope the turn's details ride in a nested `straiker`
+-- block**, beside `hookSpecificOutput`; the neutral body carries the same fields
+-- at its top level. Read them through this, never off `verdict` directly: read at
+-- the top level of a gateway reply, `blocked_by` and `action` are always absent.
+local function details_of(verdict)
+  local nested = verdict and verdict.straiker
+  if type(nested) == "table" then return nested end
+  return verdict or {}
+end
+
 -- One place decides what a verdict means, so the two phases cannot drift.
 --
 -- The neutral v3 body answers `action` as allow / detect / block. `detect` is NOT a
@@ -380,11 +427,28 @@ end
 -- which is the one failure direction that must never be silent.
 local function blocked(verdict)
   local action = decision_of(verdict)
-  return action == "block" or action == "deny"
+  if action == "block" or action == "deny" then return true end
+  -- The two are written together. Should they ever disagree, the block wins.
+  return details_of(verdict).action == "block"
+end
+
+-- What `x-straiker-verdict` and the log record report: allow, detect or block.
+--
+-- ⚠️ **`permissionDecision` is binary, so it cannot be the label.** A control that
+-- fired in detect mode answers `allow` there, which made a detect-mode finding
+-- indistinguishable from a clean turn. The three-way answer is the details'
+-- `action`.
+local function verdict_label(verdict)
+  if not verdict then return nil end
+  if blocked(verdict) then return "block" end
+  local action = present(details_of(verdict).action)
+  if action == "detect" then return "detect" end
+  if action or decision_of(verdict) then return "allow" end
+  return nil
 end
 
 local function block_text(verdict)
-  local blocked_by = verdict.blocked_by
+  local blocked_by = details_of(verdict).blocked_by
   if type(blocked_by) ~= "table" or #blocked_by == 0 then
     blocked_by = { "policy" }
   end
@@ -399,10 +463,53 @@ local function block_text(verdict)
             .. table.concat(blocked_by, ", ") .. ")."
 end
 
+-- ---------------------------------------------------------------------------
+-- Kong's log record.
+--
+-- `straiker.session_id` once, then each scored phase under `straiker.request` /
+-- `straiker.response`, in the record every logging plugin serializes (http-log,
+-- file-log, ...), so an operator can follow a request to its Straiker turns from
+-- their own logs. Kept to what that takes: the record is shipped on every request.
+-- `action` is the `x-straiker-verdict` label, so `degraded` and `unknown` show here
+-- too; why a phase degraded is in the error-log line `degraded()` writes.
+--
+-- ⚠️ **`set_serialize_value` raises on anything but nil, numbers, strings, booleans
+-- and tables of those**, and `cjson.null` is userdata. So every value is copied
+-- through `plain()`, and the call is guarded: on the prompt path an error here
+-- would fail the request, which is a worse outcome than a missing log field.
+local RECORDED = { "turn_id", "controls", "blocked_by", "events_scored" }
+
+local function plain(v)
+  local t = type(v)
+  if t == "string" or t == "number" or t == "boolean" then return v end
+  if t ~= "table" then return nil end
+  local out = {}
+  for i, item in ipairs(v) do out[i] = plain(item) end
+  -- Keeps an empty list encoding as [] rather than {}.
+  if #out == 0 and cjson.array_mt then setmetatable(out, cjson.array_mt) end
+  return out
+end
+
+local function record(phase, label, verdict)
+  local details = verdict and details_of(verdict) or {}
+  local entry = { action = label }
+  for _, key in ipairs(RECORDED) do entry[key] = plain(details[key]) end
+  -- The session Straiker filed the turn under. It answers none when it scored
+  -- nothing new, or was not reached, so fall back to the one this plugin sent.
+  local session = plain(details.session_id) or ngx.ctx.straiker_session
+  local ok, set_err = pcall(function()
+    kong.log.set_serialize_value("straiker." .. phase, entry)
+    if session then kong.log.set_serialize_value("straiker.session_id", session) end
+  end)
+  if not ok then log_warn("could not add the %s verdict to the log record: %s",
+                          phase, tostring(set_err)) end
+end
+
 -- A degraded control must stay visible. Silence here is what makes an outage look
 -- like a clean allow, which is the failure this whole artifact exists to catch.
 local function degraded(conf, where, err, model, streaming)
   log_warn("%s scoring failed: %s", where, err or "unknown")
+  record(where, "degraded")
   if conf.fail_closed then
     return deny("Straiker is unreachable and this gateway is fail-closed.",
                 model, streaming)
@@ -433,6 +540,16 @@ function Straiker:access(conf)
     kong.service.request.set_header(conf.upstream_key_header, conf.upstream_api_key)
     if conf.upstream_key_header ~= "authorization" then
       kong.service.request.clear_header("authorization")
+    end
+    -- ⚠️ **Without this the provider key is in every log record.** The header set
+    -- above is on the request Kong logs, and the record every logging plugin
+    -- serializes (http-log, file-log, ...) copies its headers. Measured on
+    -- 3.15: file-log printed the gateway's provider key in plain text.
+    local ok, mask_err = pcall(kong.log.set_serialize_value,
+      "request.headers." .. string.lower(conf.upstream_key_header), "REDACTED")
+    if not ok then
+      log_warn("could not mask %s in the log record: %s",
+               conf.upstream_key_header, tostring(mask_err))
     end
   end
 
@@ -512,7 +629,9 @@ function Straiker:access(conf)
     return degraded(conf, "request", err, req.model, ctx.straiker_streaming)
   end
 
-  kong.response.set_header(VERDICT_HEADER, decision_of(verdict) or "unknown")
+  local label = verdict_label(verdict) or "unknown"
+  kong.response.set_header(VERDICT_HEADER, label)
+  record("request", label, verdict)
   if blocked(verdict) then
     -- ⚠️ A pre-call block still runs header_filter, body_filter and log, so the
     -- post-call relay below would fire for a request that never reached the model
@@ -581,7 +700,9 @@ if MODE == "buffered" then
       return degraded(conf, "response", err, ctx.straiker_model, ctx.straiker_streaming)
     end
 
-    kong.response.set_header(VERDICT_HEADER, decision_of(verdict) or "unknown")
+    local label = verdict_label(verdict) or "unknown"
+    kong.response.set_header(VERDICT_HEADER, label)
+    record("response", label, verdict)
     if blocked(verdict) then
       -- `kong.response.set_raw_body()` raises here and 500s: it only works in
       -- `body_filter`. Exiting replaces the whole answer, which is what we want.
@@ -659,8 +780,16 @@ else
       elseif blocked(verdict) then
         -- Advisory by construction: the client already has these bytes. Said out
         -- loud so a log reader is not misled into thinking something was stopped.
-        log_warn("relay verdict was BLOCK but the answer had already streamed: %s",
-                 table.concat(verdict.blocked_by or {}, ", "))
+        -- This is the only place the answer's verdict can go in streaming mode: the
+        -- log record was serialized before this timer ran.
+        -- `blocked_by` can arrive as JSON null, which is truthy userdata here and
+        -- makes `table.concat` raise inside the timer, losing this line.
+        -- Prefixed by hand: inside a timer Kong stamps `[kong]`, not the plugin name.
+        local details = details_of(verdict)
+        local by = details.blocked_by
+        log_warn("[straiker] relay verdict was BLOCK but the answer had already streamed: %s (turn %s)",
+                 type(by) == "table" and table.concat(by, ", ") or "policy",
+                 tostring(present(details.turn_id) or "unknown"))
       end
     end)
     if not ok then log_warn("could not schedule the relay: %s", err or "unknown") end

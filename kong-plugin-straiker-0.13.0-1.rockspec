@@ -1,5 +1,5 @@
 package = "kong-plugin-straiker"
-version = "0.12.0-1"
+version = "0.13.0-1"
 supported_platforms = { "linux", "macosx" }
 source = {
    url = "file://./",
@@ -44,6 +44,13 @@ tools/check-plugin-layout.sh enforces it.
 
 Enable with:
   KONG_PLUGINS=bundled,straiker
+
+v0.13.0 -- Straiker's turn details go on Kong's log record (straiker.session_id,
+then straiker.request and straiker.response: action, turn_id, controls,
+blocked_by, events_scored). x-straiker-verdict reports detect, which read as
+allow before. The injected upstream_api_key is masked in the log record.
+Derived sessions seed on the first user message and the caller. No config
+changes.
 
 v0.12.0 -- BREAKING. The three plugins are replaced by one. Both
 straiker-coding-agent-buffered and straiker-coding-agent-streaming are
