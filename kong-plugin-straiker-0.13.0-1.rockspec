@@ -48,7 +48,8 @@ Enable with:
 v0.13.0 -- Straiker's turn details go on Kong's log record (straiker.session_id,
 then straiker.request and straiker.response: action, turn_id, controls,
 blocked_by, events_scored). x-straiker-verdict reports detect, which read as
-allow before. The injected upstream_api_key is masked in the log record.
+allow before, and in buffered mode keeps the worse of the prompt's and the
+answer's verdicts. The injected upstream_api_key is masked in the log record.
 Derived sessions seed on the first user message and the caller. No config
 changes.
 

@@ -84,7 +84,7 @@ Every response carries `x-straiker-verdict`:
 
 Alert on `degraded` and `unknown`. Both mean the control is not running while the traffic looks healthy.
 
-In `buffered` mode the header carries the answer's verdict, so a prompt verdict can be overwritten. The log record below keeps both.
+In `buffered` mode the prompt and the answer are both scored and the header carries the worse of the two, in the order `block`, `degraded`, `unknown`, `detect`, `allow`. A flagged prompt with a clean answer reads `detect`. The log record below keeps each phase's own label.
 
 ### The log record
 
@@ -441,6 +441,7 @@ You want HTTP 200 and `x-straiker-verdict: allow`. Keep `max_tokens` generous wh
 No config changes. What you will notice:
 
 - **`x-straiker-verdict` reports `detect`.** In 0.12.x a detect-mode finding read as `allow`. Anything alerting on the header sees the new value.
+- **In `buffered` mode the header keeps the worse of the prompt's and the answer's verdicts.** In 0.12.x the answer's verdict replaced the prompt's, so a `degraded` prompt followed by a clean answer read `allow`.
 - **The log record gains a `straiker` block.** See [The log record](#the-log-record). Every log-serializing plugin carries it; drop it with `custom_fields_by_lua` if you do not want it.
 - **The injected `upstream_api_key` is masked in the log record.** In 0.12.x any logging plugin received it in plain text with the request headers. If one was on, rotate that key.
 - **Derived session ids change.** They now seed on the first user message rather than `messages[1]`, and include the caller, so two users who open with the same words get separate sessions. A conversation that started under 0.12.x gets a new id after the upgrade. Requests carrying `x-claude-code-session-id` are unaffected.

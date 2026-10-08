@@ -505,16 +505,31 @@ local function record(phase, label, verdict)
                           phase, tostring(set_err)) end
 end
 
+-- ⚠️ **In buffered mode both halves stamp the one header, so the worse label wins.**
+-- The answer's verdict used to overwrite the prompt's: a flagged prompt with a clean
+-- answer read `allow`, and so did a prompt that was never scored, which hid the
+-- `degraded` that operators are told to alert on. A block does not pass through
+-- here: `deny` sets the header on the exit itself.
+local SEVERITY = { allow = 1, detect = 2, unknown = 3, degraded = 4, block = 5 }
+
+local function stamp(label)
+  local ctx = ngx.ctx
+  local prior = ctx.straiker_verdict
+  if prior and (SEVERITY[prior] or 0) > (SEVERITY[label] or 0) then label = prior end
+  ctx.straiker_verdict = label
+  kong.response.set_header(VERDICT_HEADER, label)
+end
+
 -- A degraded control must stay visible. Silence here is what makes an outage look
 -- like a clean allow, which is the failure this whole artifact exists to catch.
-local function degraded(conf, where, err, model, streaming)
-  log_warn("%s scoring failed: %s", where, err or "unknown")
-  record(where, "degraded")
+local function degraded(conf, phase, err, model, streaming)
+  log_warn("%s scoring failed: %s", phase, err or "unknown")
+  record(phase, "degraded")
   if conf.fail_closed then
     return deny("Straiker is unreachable and this gateway is fail-closed.",
                 model, streaming)
   end
-  kong.response.set_header(VERDICT_HEADER, "degraded")
+  stamp("degraded")
 end
 
 
@@ -584,7 +599,8 @@ function Straiker:access(conf)
     -- large. That is an UNSCORED request, so it answers to `fail_closed` like any
     -- other degraded check rather than quietly proxying -- which is what it used
     -- to do, in the one case where the body was too big to be boring.
-    return degraded(conf, "request body", body_err or "empty body", nil, false)
+    return degraded(conf, "request",
+                    "unreadable body (" .. (body_err or "empty body") .. ")", nil, false)
   end
 
   local req = cjson.decode(raw)
@@ -630,7 +646,7 @@ function Straiker:access(conf)
   end
 
   local label = verdict_label(verdict) or "unknown"
-  kong.response.set_header(VERDICT_HEADER, label)
+  stamp(label)
   record("request", label, verdict)
   if blocked(verdict) then
     -- ⚠️ A pre-call block still runs header_filter, body_filter and log, so the
@@ -701,7 +717,7 @@ if MODE == "buffered" then
     end
 
     local label = verdict_label(verdict) or "unknown"
-    kong.response.set_header(VERDICT_HEADER, label)
+    stamp(label)
     record("response", label, verdict)
     if blocked(verdict) then
       -- `kong.response.set_raw_body()` raises here and 500s: it only works in
