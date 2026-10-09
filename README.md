@@ -104,7 +104,7 @@ The plugin adds a `straiker` block to the log record Kong's log-serializing plug
 
 | Field | Meaning |
 | --- | --- |
-| `agent` | The agent name the plugin sent and its `source`: the `agent_from` entry that matched, `agent_ref`, or `straiker` when nothing named it and Straiker derives the agent |
+| `agent` | The agent name the plugin sent and its `source`: the `agent_from` entry that matched, `agent_ref`, `coding_agent:<tool>` for a recognised coding agent (no name is sent; Straiker names it), or `straiker` when nothing named it and Straiker derives the agent |
 | `user` | The user the plugin sent and its `source`: the `user_from` entry that matched, or `user_ref` |
 | `session_id` | The session Straiker filed the turns under |
 | `action` | Same as `x-straiker-verdict` for that phase: `allow`, `detect`, `block`, `degraded` or `unknown` |
@@ -167,7 +167,7 @@ Declare `protocols: ["http", "https"]` on each route. With no `protocols`, Kong 
 | `debug_preamble` | No | `false` | Log the system-prompt shape and lead, to explain client resolution. **Prints prompt content to the Kong log** |
 | `client` | No | — | Optional `x-s6r-client`. Leave unset on a shared gateway; set it on a single-app route |
 | `agent_ref` | No | — | Optional `x-s6r-agent`. Names **one** agent; scope it to a route. Wins over `agent_from` |
-| `agent_from` | No | `[]` | Where the agent name comes from when `agent_ref` is unset, in order: `consumer`, `consumer_custom_id`, `route`, `service`, `jwt:<claim>`, `header:<name>`. See [Agent and user attribution](#agent-and-user-attribution) |
+| `agent_from` | No | `[]` | Where the agent name comes from when `agent_ref` is unset, in order: `consumer`, `consumer_custom_id`, `route`, `service`, `jwt:<claim>`, `header:<name>`. See [Agent and user attribution](#agent-and-user-attribution). Never applies to coding agents (Claude Code, Codex) |
 | `format_hint` | No | — | `anthropic.messages` or `openai.chat`. Only breaks the messages-array tie |
 
 ### Why the upstream credential lives here
@@ -178,11 +178,30 @@ Kong resolves `{vault://env/…}` only on fields declared `referenceable`, and `
 
 Every scored call carries two names: the **agent** (which application this is) and the **user** (who is behind it). The plugin resolves both once per request, from what the gateway already knows about the caller.
 
+A gateway carries two kinds of traffic, and they are attributed differently:
+
+| | Coding agents (Claude Code, Codex) | Agents your teams build (model calls on a route) |
+|---|---|---|
+| **Agent** | The coding agent, **one per tool**. Every developer's Claude Code lands on `claude (kong)` | One per application: the route, or the application's own credential |
+| **User** | The developer: their Consumer, or `user_from` | The end user, when the application's verified token names one (`user_from: ["jwt:email"]`); otherwise the application's own Consumer |
+| **Named by** | Straiker, from the traffic. `agent_from` never applies | `agent_ref`, else `agent_from`, else Straiker's catch-all `Autonomous (kong)` |
+
+A coding agent is never named after the Consumer, route or token that carried it, so developers never become agents. The plugin recognises one by the User-Agent its CLI sends on every call:
+
+| User-Agent | Treated as |
+|---|---|
+| `claude-cli/… (external, cli)`, `(external, claude-vscode, …)`, `(external, sdk-cli)` | Claude Code: terminal, VS Code, `claude -p` |
+| `claude-cli/… (external, sdk-py, …)`, `(external, sdk-ts, …)` | An application built on the Claude Agent SDK. It runs Claude Code's binary but is one of **your** agents, so `agent_from` names it |
+| `codex_…` | Codex |
+
+A recognised coding agent is sent exactly as 0.13.x sent it, with no agent name, and Straiker files it on the agent it already has. An `agent_ref` on the route still pins it, as in 0.13.x. Claude Code's VS Code extension sends the Agent SDK system prompt and Straiker files it in `Autonomous (kong)` rather than `claude (kong)`; that is unchanged from 0.13.x. Cursor is not recognised yet.
+
 **Agent**, first match wins:
 
 1. `agent_ref`: the operator names one agent for the route.
-2. `agent_from`: the first source in the list that names one.
-3. Nothing: Straiker derives the agent from the traffic, `Autonomous (kong)` for a `messages` body or `claude (kong)` for Claude Code. One catch-all for every unnamed application.
+2. A recognised coding agent: nothing is sent, and Straiker names it (`claude (kong)`).
+3. `agent_from`: the first source in the list that names one.
+4. Nothing: Straiker derives the agent from the traffic, `Autonomous (kong)`. One catch-all for every unnamed application.
 
 **User**, first match wins:
 
@@ -493,6 +512,7 @@ No behaviour changes with the defaults: `agent_from` is empty and `user_from` is
 
 - **`agent_from` and `user_from`.** See [Agent and user attribution](#agent-and-user-attribution).
 - **The log record gains `straiker.agent` and `straiker.user`**, each with the source that named it.
+- **Coding agents are unchanged.** Claude Code and Codex are recognised by their User-Agent and never named by `agent_from`, so every developer's traffic stays on one agent per tool.
 - **Konnect:** re-upload the plugin schema (`schema.lua`) before setting either field; a control plane still holding the 0.13.x schema rejects them.
 
 ## Upgrading from 0.12.x
@@ -570,7 +590,7 @@ Set `debug_preamble: true` temporarily and look for `[straiker]` in the Kong log
 
 ### Every application lands in `Autonomous (kong)`
 
-Nothing names the applications, so Straiker files them all under its catch-all. Set `agent_ref` per route, or `agent_from` to name agents from the Consumer, a verified token claim, or the route. `straiker.agent.source` in the log record shows `straiker` for every call that nothing named. A client's `x-s6r-agent` header is ignored unless `agent_from` lists `header:x-s6r-agent`.
+Nothing names the applications, so Straiker files them all under its catch-all. Set `agent_ref` per route, or `agent_from` to name agents from the Consumer, a verified token claim, or the route. `straiker.agent.source` in the log record shows `straiker` for every call that nothing named. A client's `x-s6r-agent` header is ignored unless `agent_from` lists `header:x-s6r-agent`. Coding agents are the exception by design: `agent_from` never names them, and `source` reads `coding_agent:claude` or `coding_agent:codex`.
 
 ### Traffic reported as the wrong kind of agent
 

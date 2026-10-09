@@ -331,11 +331,47 @@ local function first_of(sources)
   return nil, nil
 end
 
--- The agent: the operator's pin, else the first `agent_from` source that names one,
--- else nothing, and Straiker derives the agent from the traffic (`Autonomous (kong)`,
--- `claude (kong)`).
-local function resolve_agent(conf)
+-- Coding agents, from the User-Agent their CLI sends on every call (captured
+-- 2026-10-09). A coding agent is ONE agent per tool -- every developer's traffic
+-- collapses onto `claude (kong)` -- and the developer is the user. `agent_from` names
+-- the agents a team builds, so it must never rename a coding agent after the consumer,
+-- route or token that carried it: that would make every developer an agent.
+--
+-- Claude Code names its entrypoint in the User-Agent:
+--   claude-cli/2.1.295 (external, cli)                          terminal
+--   claude-cli/2.1.295 (external, claude-vscode, agent-sdk/...)  VS Code
+--   claude-cli/2.1.295 (external, sdk-cli)                       `claude -p`
+--   claude-cli/2.1.294 (external, sdk-py, agent-sdk/...)         an APP built on the
+--                                                                Claude Agent SDK
+-- `sdk-py` / `sdk-ts` are a team's own agent running the same binary, so they are not
+-- Claude Code. Codex sends `codex_exec/0.157.1 (...)`.
+--
+-- A recognised coding agent is sent exactly as 0.13.0 sent it -- no agent, no client
+-- hint -- and Straiker names it from the traffic, onto the agent it always has
+-- (`claude (kong)`). Measured 2026-10-09: sending the client hint files it under the
+-- tenant-wide `claude` agent, and sending the name `claude (kong)` mints a SECOND agent
+-- of that name; either would split a tenant's coding history.
+local SDK_APP_ENTRYPOINTS = { ["sdk-py"] = true, ["sdk-ts"] = true }
+
+local function coding_agent()
+  local ua = kong.request.get_header("user-agent")
+  if type(ua) ~= "string" then return nil end
+  ua = ua:lower()
+  if ua:sub(1, 11) == "claude-cli/" then
+    local entrypoint = ua:match("%(external,%s*([%w_%-]+)")
+    if entrypoint and SDK_APP_ENTRYPOINTS[entrypoint] then return nil end
+    return "claude"
+  end
+  if ua:sub(1, 6) == "codex_" then return "codex" end
+  return nil
+end
+
+-- The agent: the operator's pin, else nothing for a coding agent (Straiker names it,
+-- as before), else the first `agent_from` source that names one, else nothing, and
+-- Straiker derives the agent from the traffic (`Autonomous (kong)`).
+local function resolve_agent(conf, coding)
   if conf.agent_ref then return conf.agent_ref, "agent_ref" end
+  if coding then return nil, "coding_agent:" .. coding end
   return first_of(conf.agent_from)
 end
 
@@ -625,8 +661,9 @@ end
 
 -- Who the turn was attributed to, and why, so "why is this app in Autonomous (kong)"
 -- is answerable from the gateway's own logs. `source` is the `agent_from` /
--- `user_from` entry that matched, `agent_ref` / `user_ref`, or `straiker` when nothing
--- named the agent and Straiker derives it from the traffic.
+-- `user_from` entry that matched, `agent_ref` / `user_ref`, `coding_agent:<tool>` when
+-- a coding agent was recognised (Straiker names it, one agent per tool), or `straiker`
+-- when nothing named the agent and Straiker derives it from the traffic.
 local function record_attribution(ctx)
   local ok, set_err = pcall(function()
     kong.log.set_serialize_value("straiker.agent",
@@ -754,7 +791,8 @@ function Straiker:access(conf)
   -- `kong.request` is unavailable. See `hint_headers`.
   ctx.straiker_cc_session = kong.request.get_header("x-claude-code-session-id")
   -- Who this traffic is, resolved here, in a real phase, for every half that is scored.
-  ctx.straiker_agent, ctx.straiker_agent_source = resolve_agent(conf)
+  ctx.straiker_coding_agent = coding_agent()
+  ctx.straiker_agent, ctx.straiker_agent_source = resolve_agent(conf, ctx.straiker_coding_agent)
   acting_user(conf)
   record_attribution(ctx)
 

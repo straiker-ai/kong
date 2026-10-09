@@ -206,14 +206,15 @@ return {
           -- Gateway-established sources: consumer, consumer_custom_id, route, service, and
           -- jwt:<claim> from a token an auth plugin verified. `header:<name>` reads a
           -- header the CALLER sets; list it only where callers are trusted to name
-          -- themselves. Empty (the default) keeps 0.13.x behaviour.
+          -- themselves. Empty (the default) keeps 0.13.x behaviour. Never applied to a
+          -- recognised coding agent (handler.lua `coding_agent`): one agent per tool.
           type = "array", default = {},
           elements = { type = "string", match_any = {
             patterns = { "^consumer$", "^consumer_custom_id$", "^route$", "^service$",
                          "^jwt:.+$", "^header:[%w_%-]+$" },
             err = "must be consumer, consumer_custom_id, route, service, jwt:<claim> or header:<name>",
           } },
-          description = "Where the agent name comes from when agent_ref is unset, in order: consumer, consumer_custom_id, route, service, jwt:<claim>, header:<name>.",
+          description = "Where the agent name comes from when agent_ref is unset, in order: consumer, consumer_custom_id, route, service, jwt:<claim>, header:<name>. Never applied to coding agents (Claude Code, Codex), which stay one agent per tool.",
       } },
       { format_hint = {
           -- Only consulted where structure cannot decide, which is the OpenAI /
