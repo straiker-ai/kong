@@ -73,7 +73,7 @@ local http  = require "resty.http"
 -- a captured request and a captured relay. A provider where ai-proxy genuinely
 -- reshapes the traffic would hand us its translation on both halves. If the raw
 -- client bytes must be guaranteed, keep ai-proxy off that route.
-local Straiker = { PRIORITY = 760, VERSION = "0.13.0" }
+local Straiker = { PRIORITY = 760, VERSION = "0.14.0" }
 
 -- Read ONCE, at module load. See the header for why this cannot be config.
 local MODE = os.getenv("STRAIKER_KONG_MODE")
@@ -192,13 +192,15 @@ end
 -- logged at error level under `[timer-ng]` rather than under the plugin, and with
 -- nothing reaching Detect. Streaming mode was scoring the prompt and silently
 -- nothing else. Capture in `access`, where the phase is real, and carry the value.
-local function hint_headers(conf, session)
+local function hint_headers(conf, session, agent)
   local headers = {
     ["Content-Type"]  = "application/json",
     ["Authorization"] = "Bearer " .. conf.api_key,
   }
   if conf.client      then headers["x-s6r-client"] = conf.client end
-  if conf.agent_ref   then headers["x-s6r-agent"]  = conf.agent_ref end
+  -- `agent` is resolved once, in `access`, by `resolve_agent`: `agent_ref`, else the
+  -- first `agent_from` source that names one. Passed in for the reason `session` is.
+  if agent            then headers["x-s6r-agent"]  = agent end
   if conf.format_hint then headers["x-s6r-format"] = conf.format_hint end
 
   -- Forwarded when the client sends it: it is how a coding session groups, and the
@@ -216,29 +218,145 @@ end
 -- Adding these does not change how the payload is classified: neither field is a
 -- format discriminator, so a Messages body enriched this way is still read as a
 -- Messages body. Verified rather than assumed.
--- Who the turn is about.
+-- ---------------------------------------------------------------------------
+-- Attribution: which agent and which user a turn belongs to.
 --
--- The Kong Consumer first. This plugin's priority (760) sits below the auth plugins
--- (key-auth 1250, jwt 1450), so on an authenticated route the consumer is already
--- resolved by the time `access` runs and it names the actual caller rather than the
--- route. `user_ref` is the static per-route fallback for routes with no auth.
+-- Both are resolved ONCE, in `access`, from what the gateway itself knows about the
+-- caller, and carried in `ngx.ctx` to the answer phases (the streaming relay runs in
+-- a timer where `kong.client` and `kong.router` do not exist).
 --
--- ⚠️ **There is deliberately no `x-consumer-username` fallback.** Reading that header
--- when no consumer resolves means that on an UNAUTHENTICATED route the caller picks
--- the name recorded against their own traffic -- `curl -H 'x-consumer-username: …'`
--- is the whole attack. An unauthenticated route has no identity to report, so the
--- honest answer there is `user_ref` or nothing.
+-- Sources, shared by `agent_from` and `user_from`, each tried in the order listed:
 --
--- Safe in every phase this is reached from: `access` for the prompt, `response` or
--- `log` for the answer. The streaming relay builds its payload in `log`, before the
--- timer, precisely because `kong.client` does not exist inside one.
-local function acting_user(conf)
-  local get_consumer = kong.client and kong.client.get_consumer
-  local consumer = get_consumer and get_consumer()
-  if consumer and consumer.username and consumer.username ~= "" then
-    return consumer.username
+--   consumer            the Kong Consumer's username, resolved by an auth plugin
+--   consumer_custom_id  that Consumer's `custom_id`
+--   jwt:<claim>         a claim of the token an auth plugin VERIFIED (`jwt`,
+--                       `openid-connect`, anything that calls `kong.client.set_token`).
+--                       Never parsed from the raw request header.
+--   route / service     the matched Route's or Service's name
+--   header:<name>       a request header, which the CALLER controls. Agent only, and
+--                       only when the operator lists it.
+--
+-- ⚠️ **There is deliberately no `x-consumer-username` fallback for the user.** Reading
+-- that header when no consumer resolves means that on an UNAUTHENTICATED route the
+-- caller picks the name recorded against their own traffic -- `curl -H
+-- 'x-consumer-username: …'` is the whole attack. A user comes from what an auth plugin
+-- established, or from `user_ref`, or not at all.
+-- ---------------------------------------------------------------------------
+
+local NAME_MAX = 200
+
+-- A value fit to send as a name: trimmed, single-line, bounded.
+local function clean(v)
+  if type(v) == "number" then v = tostring(v) end
+  if type(v) ~= "string" then return nil end
+  v = (v:gsub("^%s+", ""):gsub("%s+$", ""))
+  if v == "" or v:find("%c") then return nil end
+  if #v > NAME_MAX then v = v:sub(1, NAME_MAX) end
+  return v
+end
+
+-- The claims of the token an auth plugin verified on this request, or nil.
+--
+-- Kong 3.15+ decodes it for us (`kong.client.get_jwt_token_payload`). Earlier releases
+-- only keep the verified compact token in `kong.ctx.shared.authenticated_jwt_token`
+-- (the `jwt` and `openid-connect` plugins set it), so decode that. Either way the
+-- token is one an auth plugin already accepted: the signature was checked there.
+local function verified_claims()
+  local client = kong.client
+  if client and client.get_jwt_token_payload then
+    local ok, payload = pcall(client.get_jwt_token_payload)
+    if ok and type(payload) == "table" then return payload end
   end
-  return conf.user_ref
+  local shared = kong.ctx and kong.ctx.shared
+  local token = shared and shared.authenticated_jwt_token
+  if type(token) ~= "string" then return nil end
+  local segment = token:match("^[^.]+%.([^.]+)%.")
+  if not segment then return nil end
+  segment = segment:gsub("%-", "+"):gsub("_", "/")
+  local rem = #segment % 4
+  if rem > 0 then segment = segment .. string.rep("=", 4 - rem) end
+  local raw = ngx.decode_base64(segment)
+  local claims = raw and cjson.decode(raw)
+  return type(claims) == "table" and claims or nil
+end
+
+-- A claim by exact name first, so a namespaced claim such as
+-- `https://example.com/app` works, then as a dotted path into nested objects.
+local function claim(claims, name)
+  if type(claims) ~= "table" then return nil end
+  local v = claims[name]
+  if v == nil and name:find(".", 1, true) then
+    v = claims
+    for part in name:gmatch("[^.]+") do
+      if type(v) ~= "table" then v = nil break end
+      v = v[part]
+    end
+  end
+  return clean(v)
+end
+
+local function consumer()
+  local get = kong.client and kong.client.get_consumer
+  return get and get() or nil
+end
+
+local function from_source(source, claims)
+  if source == "consumer" then
+    local c = consumer(); return c and clean(c.username)
+  elseif source == "consumer_custom_id" then
+    local c = consumer(); return c and clean(c.custom_id)
+  elseif source == "route" then
+    local r = kong.router.get_route(); return r and clean(r.name)
+  elseif source == "service" then
+    local s = kong.router.get_service(); return s and clean(s.name)
+  end
+  local claim_name = source:match("^jwt:(.+)$")
+  if claim_name then return claim(claims(), claim_name) end
+  local header = source:match("^header:(.+)$")
+  if header then return clean(kong.request.get_header(header)) end
+  return nil
+end
+
+-- The first source in `sources` that names something, and which source it was.
+local function first_of(sources)
+  local cache
+  local function claims()
+    if cache == nil then cache = verified_claims() or false end
+    return cache or nil
+  end
+  for _, source in ipairs(sources or {}) do
+    local value = from_source(source, claims)
+    if value then return value, source end
+  end
+  return nil, nil
+end
+
+-- The agent: the operator's pin, else the first `agent_from` source that names one,
+-- else nothing, and Straiker derives the agent from the traffic (`Autonomous (kong)`,
+-- `claude (kong)`).
+local function resolve_agent(conf)
+  if conf.agent_ref then return conf.agent_ref, "agent_ref" end
+  return first_of(conf.agent_from)
+end
+
+-- The user: the first `user_from` source (default: the Consumer), else `user_ref`.
+local function resolve_user(conf)
+  local user, source = first_of(conf.user_from or { "consumer" })
+  if user then return user, source end
+  if conf.user_ref then return conf.user_ref, "user_ref" end
+  return nil, nil
+end
+
+-- Resolved once per request and cached, because both the session seed and every
+-- scored phase ask. Safe in `access`, `response` and `log`; the streaming relay
+-- builds its payload in `log`, before the timer, for this reason.
+local function acting_user(conf)
+  local ctx = ngx.ctx
+  if not ctx.straiker_user_resolved then
+    ctx.straiker_user, ctx.straiker_user_source = resolve_user(conf)
+    ctx.straiker_user_resolved = true
+  end
+  return ctx.straiker_user
 end
 
 local function with_identity(conf, ctx, payload)
@@ -339,7 +457,7 @@ end
 -- Returns the decoded verdict, or nil plus an error string.
 -- `session` is the client's `x-claude-code-session-id`, captured in `access`; see
 -- `hint_headers` for why it cannot be read here.
-local function score(conf, payload, session)
+local function score(conf, payload, session, agent)
   local body = cjson.encode(payload)
   if not body then return nil, "could not encode the payload" end
   if #body > conf.max_body_bytes then
@@ -349,7 +467,7 @@ local function score(conf, payload, session)
   local httpc = http.new()
   httpc:set_timeout(conf.timeout_ms)
 
-  local headers = hint_headers(conf, session)
+  local headers = hint_headers(conf, session, agent)
   headers["Content-Length"] = #body
 
   local res, err = httpc:request_uri(conf.detect_url, {
@@ -505,6 +623,23 @@ local function record(phase, label, verdict)
                           phase, tostring(set_err)) end
 end
 
+-- Who the turn was attributed to, and why, so "why is this app in Autonomous (kong)"
+-- is answerable from the gateway's own logs. `source` is the `agent_from` /
+-- `user_from` entry that matched, `agent_ref` / `user_ref`, or `straiker` when nothing
+-- named the agent and Straiker derives it from the traffic.
+local function record_attribution(ctx)
+  local ok, set_err = pcall(function()
+    kong.log.set_serialize_value("straiker.agent",
+      { name = ctx.straiker_agent, source = ctx.straiker_agent_source or "straiker" })
+    if ctx.straiker_user then
+      kong.log.set_serialize_value("straiker.user",
+        { name = ctx.straiker_user, source = ctx.straiker_user_source })
+    end
+  end)
+  if not ok then log_warn("could not add attribution to the log record: %s",
+                          tostring(set_err)) end
+end
+
 -- ⚠️ **In buffered mode both halves stamp the one header, so the worse label wins.**
 -- The answer's verdict used to overwrite the prompt's: a flagged prompt with a clean
 -- answer read `allow`, and so did a prompt that was never scored, which hid the
@@ -618,6 +753,10 @@ function Straiker:access(conf)
   -- Read HERE, in a real phase, because the streaming relay runs in a timer where
   -- `kong.request` is unavailable. See `hint_headers`.
   ctx.straiker_cc_session = kong.request.get_header("x-claude-code-session-id")
+  -- Who this traffic is, resolved here, in a real phase, for every half that is scored.
+  ctx.straiker_agent, ctx.straiker_agent_source = resolve_agent(conf)
+  acting_user(conf)
+  record_attribution(ctx)
 
   if conf.debug_preamble then
     local sys, shape = req.system, type(req.system)
@@ -640,7 +779,7 @@ function Straiker:access(conf)
   local scored = {}
   for k, v in pairs(req) do scored[k] = v end
   local verdict, err = score(conf, with_identity(conf, ctx, scored),
-                             ctx.straiker_cc_session)
+                             ctx.straiker_cc_session, ctx.straiker_agent)
   if not verdict then
     return degraded(conf, "request", err, req.model, ctx.straiker_streaming)
   end
@@ -711,7 +850,7 @@ if MODE == "buffered" then
     if not body or body == "" then return end
 
     local verdict, err = score(conf, answer_envelope(conf, ctx, body, PHASE_BUFFERED),
-                               ctx.straiker_cc_session)
+                               ctx.straiker_cc_session, ctx.straiker_agent)
     if not verdict then
       return degraded(conf, "response", err, ctx.straiker_model, ctx.straiker_streaming)
     end
@@ -781,6 +920,7 @@ else
     -- Pulled out of ctx HERE, while the request still exists. The timer below gets
     -- a fresh ngx.ctx, so anything it needs has to be an upvalue by then.
     local cc_session = ctx.straiker_cc_session
+    local agent = ctx.straiker_agent
 
     -- ⚠️ Cosockets are UNAVAILABLE in `log_by_lua`. `resty.http` there fails with
     -- "API disabled in the context of log_by_lua*", the phase aborts, and the
@@ -790,7 +930,7 @@ else
     -- by the time a timer runs, the answer has long since left.
     local ok, err = ngx.timer.at(0, function(premature)
       if premature then return end
-      local verdict, serr = score(conf, payload, cc_session)
+      local verdict, serr = score(conf, payload, cc_session, agent)
       if not verdict then
         log_warn("relay scoring failed: %s", serr or "unknown")
       elseif blocked(verdict) then

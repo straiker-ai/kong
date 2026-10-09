@@ -132,7 +132,19 @@ return {
           -- documents for request-transformer, reproduced in our own schema. Any field
           -- that a `.env` value reaches has to carry this flag.
           type = "string", referenceable = true,
-          description = "Fallback attribution when no Kong Consumer is resolved, e.g. user@example.com.",
+          description = "Fallback user when no user_from source names one, e.g. user@example.com.",
+      } },
+      { user_from = {
+          -- Where the user comes from, tried in order; `user_ref` after them. Only what an
+          -- auth plugin established: the Consumer, its custom_id, or a claim of the token
+          -- an auth plugin verified (jwt, openid-connect). Never a request header -- on an
+          -- unauthenticated route that would let the caller name themselves.
+          type = "array", default = { "consumer" },
+          elements = { type = "string", match_any = {
+            patterns = { "^consumer$", "^consumer_custom_id$", "^jwt:.+$" },
+            err = "must be consumer, consumer_custom_id or jwt:<claim>",
+          } },
+          description = "Where the user comes from, in order: consumer, consumer_custom_id, jwt:<claim>. user_ref is used after these.",
       } },
       { session_from_body = {
           -- A digest of the preamble plus the first user message. Stable across the
@@ -184,7 +196,24 @@ return {
           -- this value, so sharing it across several agents merges them into one.
           -- Scope it per-route, not per-gateway.
           type = "string",
-          description = "Optional x-s6r-agent. Names one agent; scope it to a route.",
+          description = "Optional x-s6r-agent. Names one agent; scope it to a route. Wins over agent_from.",
+      } },
+      { agent_from = {
+          -- Where the agent name comes from when `agent_ref` is not set, tried in order.
+          -- The first source that names something wins; when none does, Straiker derives
+          -- the agent from the traffic (`Autonomous (kong)`, `claude (kong)`), as before.
+          --
+          -- Gateway-established sources: consumer, consumer_custom_id, route, service, and
+          -- jwt:<claim> from a token an auth plugin verified. `header:<name>` reads a
+          -- header the CALLER sets; list it only where callers are trusted to name
+          -- themselves. Empty (the default) keeps 0.13.x behaviour.
+          type = "array", default = {},
+          elements = { type = "string", match_any = {
+            patterns = { "^consumer$", "^consumer_custom_id$", "^route$", "^service$",
+                         "^jwt:.+$", "^header:[%w_%-]+$" },
+            err = "must be consumer, consumer_custom_id, route, service, jwt:<claim> or header:<name>",
+          } },
+          description = "Where the agent name comes from when agent_ref is unset, in order: consumer, consumer_custom_id, route, service, jwt:<claim>, header:<name>.",
       } },
       { format_hint = {
           -- Only consulted where structure cannot decide, which is the OpenAI /
