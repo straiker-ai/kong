@@ -92,8 +92,6 @@ The plugin adds a `straiker` block to the log record Kong's log-serializing plug
 
 ```json
 "straiker": {
-  "agent": { "name": "Order Support Copilot", "source": "jwt:app_displayname" },
-  "user":  { "name": "alice@example.com", "source": "jwt:email" },
   "session_id": "cc-session-113207",
   "request":  { "action": "detect", "turn_id": "01a117a3-209a-718b-272e-92ea1466bba0",
                 "controls": ["ca_malicious_packages"], "blocked_by": [], "events_scored": 3 },
@@ -104,8 +102,6 @@ The plugin adds a `straiker` block to the log record Kong's log-serializing plug
 
 | Field | Meaning |
 | --- | --- |
-| `agent` | The agent name the plugin sent and its `source`: the `agent_from` entry that matched, `agent_ref`, `coding_agent:<tool>` for a recognised coding agent (no name is sent; Straiker names it), or `straiker` when nothing named it and Straiker derives the agent |
-| `user` | The user the plugin sent and its `source`: the `user_from` entry that matched, or `user_ref` |
 | `session_id` | The session Straiker filed the turns under |
 | `action` | Same as `x-straiker-verdict` for that phase: `allow`, `detect`, `block`, `degraded` or `unknown` |
 | `turn_id` | The Straiker turn, for looking it up in the console |
@@ -161,88 +157,57 @@ Declare `protocols: ["http", "https"]` on each route. With no `protocols`, Kong 
 | `max_body_bytes` | No | `10485760` | Skip scoring above this size |
 | `upstream_api_key` | No | — | Model credential the **gateway** holds, injected on the way out. Vault-referenceable |
 | `upstream_key_header` | No | `x-api-key` | Header to carry it. `x-api-key` for Anthropic, `authorization` for OpenAI-style |
-| `user_ref` | No | — | Fallback user, used only when no `user_from` source names one. Vault-referenceable |
-| `user_from` | No | `["consumer"]` | Where the user comes from, in order: `consumer`, `consumer_custom_id`, `jwt:<claim>`. See [Agent and user attribution](#agent-and-user-attribution) |
+| `user_ref` | No | — | Fallback attribution, used only when no Kong Consumer is resolved. On an authenticated route the Consumer wins. Vault-referenceable |
 | `session_from_body` | No | `true` | Derive a stable session id when the client sends no header |
+| `send_gateway_metadata` | No | `true` | Send the Route, Service, Consumer, verified token claims, User-Agent and request id to Straiker as `annotations.gateway`, for attribution. IDs and names only. See [Gateway metadata](#gateway-metadata) |
 | `debug_preamble` | No | `false` | Log the system-prompt shape and lead, to explain client resolution. **Prints prompt content to the Kong log** |
 | `client` | No | — | Optional `x-s6r-client`. Leave unset on a shared gateway; set it on a single-app route |
-| `agent_ref` | No | — | Optional `x-s6r-agent`. Names **one** agent; scope it to a route. Wins over `agent_from` |
-| `agent_from` | No | `[]` | Where the agent name comes from when `agent_ref` is unset, in order: `consumer`, `consumer_custom_id`, `route`, `service`, `jwt:<claim>`, `header:<name>`. See [Agent and user attribution](#agent-and-user-attribution). Never applies to coding agents (Claude Code, Codex) |
+| `agent_ref` | No | — | Optional `x-s6r-agent`. Names **one** agent; scope it to a route |
 | `format_hint` | No | — | `anthropic.messages` or `openai.chat`. Only breaks the messages-array tie |
 
 ### Why the upstream credential lives here
 
 Kong resolves `{vault://env/…}` only on fields declared `referenceable`, and `request-transformer`'s header arrays are not (`config.add.headers  type=array  referenceable=False`). A vault reference placed there reaches the provider verbatim and fails as a 401 that reads exactly like a wrong key. `upstream_api_key` is referenceable, so the reference resolves.
 
-### Agent and user attribution
+### Identity on a shared gateway
 
-Every scored call carries two names: the **agent** (which application this is) and the **user** (who is behind it). The plugin resolves both once per request, from what the gateway already knows about the caller.
+Leave `client` and `agent_ref` unset when one Kong fronts several different applications: Straiker identifies the client from the request's own system prompt, and pinning one value forces every surface onto it. Set them on a route that fronts exactly one known application, where structure alone would otherwise classify a chat assistant as the broader "autonomous agent" category.
 
-A gateway carries two kinds of traffic, and they are attributed differently:
+`agent_ref` names one agent, never a kind of agent — Straiker keys per-agent state on it, so sharing a value across several agents merges them into one.
 
-| | Coding agents (Claude Code, Codex) | Agents your teams build (model calls on a route) |
-|---|---|---|
-| **Agent** | The coding agent, **one per tool**. Every developer's Claude Code lands on `claude (kong)` | One per application: the route, or the application's own credential |
-| **User** | The developer: their Consumer, or `user_from` | The end user, when the application's verified token names one (`user_from: ["jwt:email"]`); otherwise the application's own Consumer |
-| **Named by** | Straiker, from the traffic. `agent_from` never applies | `agent_ref`, else `agent_from`, else Straiker's catch-all `Autonomous (kong)` |
+### Gateway metadata
 
-A coding agent is never named after the Consumer, route or token that carried it, so developers never become agents. The plugin recognises one by the User-Agent its CLI sends on every call:
+Every scored call tells Straiker what Kong knows about it, so Straiker can attribute the call. On a shared gateway that covers many applications, this answers "which app was this?" from facts rather than from the prompt. The block is sent as `annotations.gateway` in the copy posted to Straiker:
 
-| User-Agent | Treated as |
-|---|---|
-| `claude-cli/… (external, cli)`, `(external, claude-vscode, …)`, `(external, sdk-cli)` | Claude Code: terminal, VS Code, `claude -p` |
-| `claude-cli/… (external, sdk-py, …)`, `(external, sdk-ts, …)` | An application built on the Claude Agent SDK. It runs Claude Code's binary but is one of **your** agents, so `agent_from` names it |
-| `codex_…` | Codex |
-
-A recognised coding agent is sent exactly as 0.13.x sent it, with no agent name, and Straiker files it on the agent it already has. An `agent_ref` on the route still pins it, as in 0.13.x. Claude Code's VS Code extension sends the Agent SDK system prompt and Straiker files it in `Autonomous (kong)` rather than `claude (kong)`; that is unchanged from 0.13.x. Cursor is not recognised yet.
-
-**Agent**, first match wins:
-
-1. `agent_ref`: the operator names one agent for the route.
-2. A recognised coding agent: nothing is sent, and Straiker names it (`claude (kong)`).
-3. `agent_from`: the first source in the list that names one.
-4. Nothing: Straiker derives the agent from the traffic, `Autonomous (kong)`. One catch-all for every unnamed application.
-
-**User**, first match wins:
-
-1. `user_from`: the first source in the list that names one. Default `["consumer"]`.
-2. `user_ref`: the route's fallback.
-
-| Source | Agent | User | Comes from |
-|---|---|---|---|
-| `consumer` | Yes | Yes (default) | The Kong Consumer an auth plugin resolved (key-auth, jwt, openid-connect, mtls-auth, ...) |
-| `consumer_custom_id` | Yes | Yes | That Consumer's `custom_id`, for example an employee or service id |
-| `jwt:<claim>` | Yes | Yes | A claim of the token an auth plugin **verified** (`jwt`, `openid-connect`). An exact claim name first, then a dotted path into nested claims |
-| `route` | Yes | No | The matched Route's name |
-| `service` | Yes | No | The matched Service's name |
-| `header:<name>` | Yes | No | A request header. **The caller sets it**, so list it only where callers are trusted to name themselves |
-
-Examples:
-
-```yaml
-# One Consumer per application: each app's own credential names its agent.
-agent_from: [consumer]
-
-# Microsoft Entra ID through openid-connect: app-only tokens carry the app's display
-# name or client id; the user's email comes from a delegated token.
-agent_from: ["jwt:app_displayname", "jwt:azp", "jwt:appid"]
-user_from:  ["jwt:email", "jwt:upn", "consumer"]
-
-# One Route per application, named after the route, with no per-route agent_ref.
-agent_from: [route]
-
-# Let applications name themselves, falling back to their Consumer.
-agent_from: ["header:x-s6r-agent", consumer]
+```json
+"annotations": {
+  "gateway": {
+    "type": "kong",
+    "plugin_version": "0.14.0",
+    "route":    { "id": "8f3c2a10-…", "name": "claims-intake" },
+    "service":  { "id": "41aa…", "name": "openai" },
+    "consumer": { "id": "a9e1…", "username": "claims-svc", "custom_id": "svc-1001" },
+    "token":    { "iss": "https://login.microsoftonline.com/…/v2.0", "azp": "…", "email": "dana@example.com" },
+    "user_agent": "claude-cli/2.1.295 (external, cli)",
+    "request_id": "…"
+  }
+}
 ```
 
-Notes:
+| Field | From | Present when |
+|---|---|---|
+| `route`, `service` | The matched Route and Service | Always |
+| `consumer` | The Consumer an auth plugin resolved | The route has an auth plugin |
+| `token` | `iss`, `azp`, `appid`, `app_displayname`, `client_id`, `email`, `upn`, `preferred_username` of the token an auth plugin **verified** (`jwt`, `openid-connect`) | A verified token carries them |
+| `user_agent` | The request's `User-Agent`, up to 256 characters | The client sent one |
+| `request_id` | Kong's request id, the same value as `x-kong-request-id` and the log record's `request.id` | Kong 3.x |
 
-- **A client's `x-s6r-agent` header is ignored unless `agent_from` lists it.** Otherwise any caller could put its traffic on another application's agent, and therefore its controls.
-- **A user never comes from a request header.** On an unauthenticated route that would let the caller choose the name recorded against their own traffic.
-- **A token claim is read only from a token an auth plugin verified**, never from the raw `Authorization` header. It keeps working when `ai-proxy` replaces that header with the provider key.
-- **Scope `agent_from` per route.** On a route that serves Claude Code, a `consumer` source names the agent after the developer's Consumer rather than `claude (kong)`. Keep coding agents on their own route without `agent_from`, or set `client: claude` there.
-- An agent name identifies **one** application, never a kind. Straiker keys per-agent state on it, so a value shared across several applications merges them into one agent. Names are permanent once used.
-- Leave `client` unset on a shared gateway. Straiker identifies the client from the request's own system prompt, and pinning one value forces every surface onto it.
+- **Facts only.** The plugin names nothing from them. The agent is still `agent_ref` or what Straiker derives from the traffic, and the user is still the Consumer or `user_ref`.
+- **Recorded, never scored.** Straiker records `annotations` and does not score them, so verdicts, agents, users and sessions are unchanged.
+- **IDs and names only.** Never a credential, a token, or any other header.
+- **Never travels upstream.** The model receives the client's request unchanged.
+- **Cannot be spoofed by the client.** Any `annotations` the client sends are dropped from the copy posted to Straiker, whether gateway metadata is on or off.
+- **Turn it off** with `send_gateway_metadata: false`.
 
 ### Enable
 
@@ -508,12 +473,7 @@ You want HTTP 200 and `x-straiker-verdict: allow`. Keep `max_tokens` generous wh
 
 ## Upgrading from 0.13.x
 
-No behaviour changes with the defaults: `agent_from` is empty and `user_from` is `["consumer"]`, which is what 0.13.x did. What is new:
-
-- **`agent_from` and `user_from`.** See [Agent and user attribution](#agent-and-user-attribution).
-- **The log record gains `straiker.agent` and `straiker.user`**, each with the source that named it.
-- **Coding agents are unchanged.** Claude Code and Codex are recognised by their User-Agent and never named by `agent_from`, so every developer's traffic stays on one agent per tool.
-- **Konnect:** re-upload the plugin schema (`schema.lua`) before setting either field; a control plane still holding the 0.13.x schema rejects them.
+No config changes. Every scored call now carries `annotations.gateway`; see [Gateway metadata](#gateway-metadata). On Konnect, upload the 0.14.0 `schema.lua` so the new `send_gateway_metadata` field is accepted.
 
 ## Upgrading from 0.12.x
 
@@ -587,10 +547,6 @@ The v3 endpoint expects a Straiker integration key, which begins `sk_agt_`. A ke
 ### No events in the Straiker Console
 
 Set `debug_preamble: true` temporarily and look for `[straiker]` in the Kong log — it prints the system-prompt shape and lead, which is what decides the client Straiker resolves. Turn it back off: it prints prompt content.
-
-### Every application lands in `Autonomous (kong)`
-
-Nothing names the applications, so Straiker files them all under its catch-all. Set `agent_ref` per route, or `agent_from` to name agents from the Consumer, a verified token claim, or the route. `straiker.agent.source` in the log record shows `straiker` for every call that nothing named. A client's `x-s6r-agent` header is ignored unless `agent_from` lists `header:x-s6r-agent`. Coding agents are the exception by design: `agent_from` never names them, and `source` reads `coding_agent:claude` or `coding_agent:codex`.
 
 ### Traffic reported as the wrong kind of agent
 

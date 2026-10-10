@@ -45,13 +45,12 @@ tools/check-plugin-layout.sh enforces it.
 Enable with:
   KONG_PLUGINS=bundled,straiker
 
-v0.14.0 -- Agent and user attribution from what the gateway already knows.
-agent_from names the agent from the Kong Consumer, its custom_id, the Route or
-Service name, a claim of the token an auth plugin verified (jwt:<claim>), or an
-opted-in request header (header:<name>), when agent_ref is unset. user_from
-names the user from the Consumer, its custom_id, or a verified token claim,
-before user_ref. The log record gains straiker.agent and straiker.user, each
-with the source that named it. Defaults keep 0.13.x behaviour.
+v0.14.0 -- Gateway metadata for attribution. Every scored call carries
+annotations.gateway: the Route and Service it came in on, the Consumer, the app
+and user claims of a token an auth plugin verified, the User-Agent and Kong's
+request id. Straiker records annotations and never scores them, so agents,
+users, sessions and verdicts are unchanged. IDs and names only, never
+credentials. send_gateway_metadata (default true) turns it off.
 
 v0.13.0 -- Straiker's turn details go on Kong's log record (straiker.session_id,
 then straiker.request and straiker.response: action, turn_id, controls,

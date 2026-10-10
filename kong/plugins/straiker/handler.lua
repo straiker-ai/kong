@@ -192,15 +192,13 @@ end
 -- logged at error level under `[timer-ng]` rather than under the plugin, and with
 -- nothing reaching Detect. Streaming mode was scoring the prompt and silently
 -- nothing else. Capture in `access`, where the phase is real, and carry the value.
-local function hint_headers(conf, session, agent)
+local function hint_headers(conf, session)
   local headers = {
     ["Content-Type"]  = "application/json",
     ["Authorization"] = "Bearer " .. conf.api_key,
   }
   if conf.client      then headers["x-s6r-client"] = conf.client end
-  -- `agent` is resolved once, in `access`, by `resolve_agent`: `agent_ref`, else the
-  -- first `agent_from` source that names one. Passed in for the reason `session` is.
-  if agent            then headers["x-s6r-agent"]  = agent end
+  if conf.agent_ref   then headers["x-s6r-agent"]  = conf.agent_ref end
   if conf.format_hint then headers["x-s6r-format"] = conf.format_hint end
 
   -- Forwarded when the client sends it: it is how a coding session groups, and the
@@ -209,53 +207,41 @@ local function hint_headers(conf, session, agent)
   return headers
 end
 
--- The identity a relayed body cannot carry, added to the DETECT payload only.
---
--- ⚠️ **Neither of these travels upstream.** The model sees the client's bytes
--- unchanged; only the copy posted to Straiker is enriched. Mutating the forwarded
--- body would change what the model is asked, which a security transport must not do.
---
--- Adding these does not change how the payload is classified: neither field is a
--- format discriminator, so a Messages body enriched this way is still read as a
--- Messages body. Verified rather than assumed.
 -- ---------------------------------------------------------------------------
--- Attribution: which agent and which user a turn belongs to.
+-- Gateway metadata: what Kong knows about the call, for Straiker to attribute it.
 --
--- Both are resolved ONCE, in `access`, from what the gateway itself knows about the
--- caller, and carried in `ngx.ctx` to the answer phases (the streaming relay runs in
--- a timer where `kong.client` and `kong.router` do not exist).
+-- Sent as `annotations.gateway` on every scored half: the Route and Service the call
+-- came in on, the Consumer an auth plugin resolved, the app and user claims of a token
+-- an auth plugin verified, the User-Agent and Kong's request id. Facts only: the plugin
+-- names nothing from them, so the agent is still `agent_ref` or what Straiker derives
+-- from the traffic, and the user is still the Consumer or `user_ref`. IDs and names
+-- only, never a credential, a token, or any other header.
 --
--- Sources, shared by `agent_from` and `user_from`, each tried in the order listed:
+-- `annotations` is recorded, never scored (v3 Detect reference). A call carrying it is
+-- named and scored exactly as one without it (measured 2026-10-09 on a v3 tenant).
 --
---   consumer            the Kong Consumer's username, resolved by an auth plugin
---   consumer_custom_id  that Consumer's `custom_id`
---   jwt:<claim>         a claim of the token an auth plugin VERIFIED (`jwt`,
---                       `openid-connect`, anything that calls `kong.client.set_token`).
---                       Never parsed from the raw request header.
---   route / service     the matched Route's or Service's name
---   header:<name>       a request header, which the CALLER controls. Agent only, and
---                       only when the operator lists it.
---
--- ⚠️ **There is deliberately no `x-consumer-username` fallback for the user.** Reading
--- that header when no consumer resolves means that on an UNAUTHENTICATED route the
--- caller picks the name recorded against their own traffic -- `curl -H
--- 'x-consumer-username: …'` is the whole attack. A user comes from what an auth plugin
--- established, or from `user_ref`, or not at all.
+-- Built once, in `access`, and carried in `ngx.ctx`: the streaming relay sends from a
+-- timer, where `kong.router`, `kong.client` and `kong.request` do not exist.
 -- ---------------------------------------------------------------------------
-
 local NAME_MAX = 200
+local USER_AGENT_MAX = 256
+-- App claims (Microsoft Entra ID app-only tokens carry `appid` or `azp`, sometimes
+-- `app_displayname`) and user claims (`email`, `upn`, `preferred_username`).
+local TOKEN_CLAIMS = { "iss", "azp", "appid", "app_displayname", "client_id",
+                       "email", "upn", "preferred_username" }
 
--- A value fit to send as a name: trimmed, single-line, bounded.
-local function clean(v)
+-- A value fit to send: trimmed, single-line, bounded.
+local function clean(v, max)
   if type(v) == "number" then v = tostring(v) end
   if type(v) ~= "string" then return nil end
   v = (v:gsub("^%s+", ""):gsub("%s+$", ""))
   if v == "" or v:find("%c") then return nil end
-  if #v > NAME_MAX then v = v:sub(1, NAME_MAX) end
+  max = max or NAME_MAX
+  if #v > max then v = v:sub(1, max) end
   return v
 end
 
--- The claims of the token an auth plugin verified on this request, or nil.
+-- The claims of the token an auth plugin verified, or nil. Never the raw header.
 --
 -- Kong 3.15+ decodes it for us (`kong.client.get_jwt_token_payload`). Earlier releases
 -- only keep the verified compact token in `kong.ctx.shared.authenticated_jwt_token`
@@ -280,123 +266,82 @@ local function verified_claims()
   return type(claims) == "table" and claims or nil
 end
 
--- A claim by exact name first, so a namespaced claim such as
--- `https://example.com/app` works, then as a dotted path into nested objects.
-local function claim(claims, name)
-  if type(claims) ~= "table" then return nil end
-  local v = claims[name]
-  if v == nil and name:find(".", 1, true) then
-    v = claims
-    for part in name:gmatch("[^.]+") do
-      if type(v) ~= "table" then v = nil break end
-      v = v[part]
+-- The named fields of a Kong entity that have a value, or nil when none do.
+local function entity(e, fields)
+  if type(e) ~= "table" then return nil end
+  local out
+  for _, f in ipairs(fields) do
+    local v = clean(e[f])
+    if v then out = out or {}; out[f] = v end
+  end
+  return out
+end
+
+local function gateway_metadata()
+  local claims, token = verified_claims(), nil
+  if claims then
+    for _, name in ipairs(TOKEN_CLAIMS) do
+      local v = clean(claims[name])
+      if v then token = token or {}; token[name] = v end
     end
   end
-  return clean(v)
+  local has_id, request_id = pcall(kong.request.get_id)
+  return {
+    type           = "kong",
+    plugin_version = Straiker.VERSION,
+    route          = entity(kong.router.get_route(), { "id", "name" }),
+    service        = entity(kong.router.get_service(), { "id", "name" }),
+    consumer       = entity(kong.client.get_consumer(), { "id", "username", "custom_id" }),
+    token          = token,
+    user_agent     = clean(kong.request.get_header("user-agent"), USER_AGENT_MAX),
+    request_id     = has_id and clean(request_id) or nil,
+  }
 end
 
-local function consumer()
-  local get = kong.client and kong.client.get_consumer
-  return get and get() or nil
-end
-
-local function from_source(source, claims)
-  if source == "consumer" then
-    local c = consumer(); return c and clean(c.username)
-  elseif source == "consumer_custom_id" then
-    local c = consumer(); return c and clean(c.custom_id)
-  elseif source == "route" then
-    local r = kong.router.get_route(); return r and clean(r.name)
-  elseif source == "service" then
-    local s = kong.router.get_service(); return s and clean(s.name)
-  end
-  local claim_name = source:match("^jwt:(.+)$")
-  if claim_name then return claim(claims(), claim_name) end
-  local header = source:match("^header:(.+)$")
-  if header then return clean(kong.request.get_header(header)) end
-  return nil
-end
-
--- The first source in `sources` that names something, and which source it was.
-local function first_of(sources)
-  local cache
-  local function claims()
-    if cache == nil then cache = verified_claims() or false end
-    return cache or nil
-  end
-  for _, source in ipairs(sources or {}) do
-    local value = from_source(source, claims)
-    if value then return value, source end
-  end
-  return nil, nil
-end
-
--- Coding agents, from the User-Agent their CLI sends on every call (captured
--- 2026-10-09). A coding agent is ONE agent per tool -- every developer's traffic
--- collapses onto `claude (kong)` -- and the developer is the user. `agent_from` names
--- the agents a team builds, so it must never rename a coding agent after the consumer,
--- route or token that carried it: that would make every developer an agent.
+-- The identity a relayed body cannot carry, added to the DETECT payload only.
 --
--- Claude Code names its entrypoint in the User-Agent:
---   claude-cli/2.1.295 (external, cli)                          terminal
---   claude-cli/2.1.295 (external, claude-vscode, agent-sdk/...)  VS Code
---   claude-cli/2.1.295 (external, sdk-cli)                       `claude -p`
---   claude-cli/2.1.294 (external, sdk-py, agent-sdk/...)         an APP built on the
---                                                                Claude Agent SDK
--- `sdk-py` / `sdk-ts` are a team's own agent running the same binary, so they are not
--- Claude Code. Codex sends `codex_exec/0.157.1 (...)`.
+-- ⚠️ **None of these travels upstream.** The model sees the client's bytes
+-- unchanged; only the copy posted to Straiker is enriched. Mutating the forwarded
+-- body would change what the model is asked, which a security transport must not do.
 --
--- A recognised coding agent is sent exactly as 0.13.0 sent it -- no agent, no client
--- hint -- and Straiker names it from the traffic, onto the agent it always has
--- (`claude (kong)`). Measured 2026-10-09: sending the client hint files it under the
--- tenant-wide `claude` agent, and sending the name `claude (kong)` mints a SECOND agent
--- of that name; either would split a tenant's coding history.
-local SDK_APP_ENTRYPOINTS = { ["sdk-py"] = true, ["sdk-ts"] = true }
-
-local function coding_agent()
-  local ua = kong.request.get_header("user-agent")
-  if type(ua) ~= "string" then return nil end
-  ua = ua:lower()
-  if ua:sub(1, 11) == "claude-cli/" then
-    local entrypoint = ua:match("%(external,%s*([%w_%-]+)")
-    if entrypoint and SDK_APP_ENTRYPOINTS[entrypoint] then return nil end
-    return "claude"
-  end
-  if ua:sub(1, 6) == "codex_" then return "codex" end
-  return nil
-end
-
--- The agent: the operator's pin, else nothing for a coding agent (Straiker names it,
--- as before), else the first `agent_from` source that names one, else nothing, and
--- Straiker derives the agent from the traffic (`Autonomous (kong)`).
-local function resolve_agent(conf, coding)
-  if conf.agent_ref then return conf.agent_ref, "agent_ref" end
-  if coding then return nil, "coding_agent:" .. coding end
-  return first_of(conf.agent_from)
-end
-
--- The user: the first `user_from` source (default: the Consumer), else `user_ref`.
-local function resolve_user(conf)
-  local user, source = first_of(conf.user_from or { "consumer" })
-  if user then return user, source end
-  if conf.user_ref then return conf.user_ref, "user_ref" end
-  return nil, nil
-end
-
--- Resolved once per request and cached, because both the session seed and every
--- scored phase ask. Safe in `access`, `response` and `log`; the streaming relay
--- builds its payload in `log`, before the timer, for this reason.
+-- Adding these does not change how the payload is classified: none of `session_id`,
+-- `original` or `annotations` is a format discriminator, so a Messages body enriched
+-- this way is still read as a Messages body. Verified rather than assumed.
+-- Who the turn is about.
+--
+-- The Kong Consumer first. This plugin's priority (760) sits below the auth plugins
+-- (key-auth 1250, jwt 1450), so on an authenticated route the consumer is already
+-- resolved by the time `access` runs and it names the actual caller rather than the
+-- route. `user_ref` is the static per-route fallback for routes with no auth.
+--
+-- ⚠️ **There is deliberately no `x-consumer-username` fallback.** Reading that header
+-- when no consumer resolves means that on an UNAUTHENTICATED route the caller picks
+-- the name recorded against their own traffic -- `curl -H 'x-consumer-username: …'`
+-- is the whole attack. An unauthenticated route has no identity to report, so the
+-- honest answer there is `user_ref` or nothing.
+--
+-- Safe in every phase this is reached from: `access` for the prompt, `response` or
+-- `log` for the answer. The streaming relay builds its payload in `log`, before the
+-- timer, precisely because `kong.client` does not exist inside one.
 local function acting_user(conf)
-  local ctx = ngx.ctx
-  if not ctx.straiker_user_resolved then
-    ctx.straiker_user, ctx.straiker_user_source = resolve_user(conf)
-    ctx.straiker_user_resolved = true
+  local get_consumer = kong.client and kong.client.get_consumer
+  local consumer = get_consumer and get_consumer()
+  if consumer and consumer.username and consumer.username ~= "" then
+    return consumer.username
   end
-  return ctx.straiker_user
+  return conf.user_ref
 end
 
 local function with_identity(conf, ctx, payload)
   if ctx.straiker_session then payload.session_id = ctx.straiker_session end
+  -- `annotations` on this copy is the gateway's alone. A client could otherwise send
+  -- its own `annotations.gateway` and claim another route or Consumer, so whatever the
+  -- client put there is dropped, with gateway metadata on or off. Neither Anthropic
+  -- Messages nor OpenAI chat defines the field, and the model never sees this copy.
+  payload.annotations = nil
+  if ctx.straiker_gateway then
+    payload.annotations = { gateway = ctx.straiker_gateway }
+  end
   local user = acting_user(conf)
   if user then
     -- The one place Straiker looks for a user on a relayed request: v3 has no user
@@ -493,7 +438,7 @@ end
 -- Returns the decoded verdict, or nil plus an error string.
 -- `session` is the client's `x-claude-code-session-id`, captured in `access`; see
 -- `hint_headers` for why it cannot be read here.
-local function score(conf, payload, session, agent)
+local function score(conf, payload, session)
   local body = cjson.encode(payload)
   if not body then return nil, "could not encode the payload" end
   if #body > conf.max_body_bytes then
@@ -503,7 +448,7 @@ local function score(conf, payload, session, agent)
   local httpc = http.new()
   httpc:set_timeout(conf.timeout_ms)
 
-  local headers = hint_headers(conf, session, agent)
+  local headers = hint_headers(conf, session)
   headers["Content-Length"] = #body
 
   local res, err = httpc:request_uri(conf.detect_url, {
@@ -659,24 +604,6 @@ local function record(phase, label, verdict)
                           phase, tostring(set_err)) end
 end
 
--- Who the turn was attributed to, and why, so "why is this app in Autonomous (kong)"
--- is answerable from the gateway's own logs. `source` is the `agent_from` /
--- `user_from` entry that matched, `agent_ref` / `user_ref`, `coding_agent:<tool>` when
--- a coding agent was recognised (Straiker names it, one agent per tool), or `straiker`
--- when nothing named the agent and Straiker derives it from the traffic.
-local function record_attribution(ctx)
-  local ok, set_err = pcall(function()
-    kong.log.set_serialize_value("straiker.agent",
-      { name = ctx.straiker_agent, source = ctx.straiker_agent_source or "straiker" })
-    if ctx.straiker_user then
-      kong.log.set_serialize_value("straiker.user",
-        { name = ctx.straiker_user, source = ctx.straiker_user_source })
-    end
-  end)
-  if not ok then log_warn("could not add attribution to the log record: %s",
-                          tostring(set_err)) end
-end
-
 -- ⚠️ **In buffered mode both halves stamp the one header, so the worse label wins.**
 -- The answer's verdict used to overwrite the prompt's: a flagged prompt with a clean
 -- answer read `allow`, and so did a prompt that was never scored, which hid the
@@ -790,11 +717,16 @@ function Straiker:access(conf)
   -- Read HERE, in a real phase, because the streaming relay runs in a timer where
   -- `kong.request` is unavailable. See `hint_headers`.
   ctx.straiker_cc_session = kong.request.get_header("x-claude-code-session-id")
-  -- Who this traffic is, resolved here, in a real phase, for every half that is scored.
-  ctx.straiker_coding_agent = coding_agent()
-  ctx.straiker_agent, ctx.straiker_agent_source = resolve_agent(conf, ctx.straiker_coding_agent)
-  acting_user(conf)
-  record_attribution(ctx)
+  -- What Kong knows about this call, for Straiker to attribute it. A failure here never
+  -- stops scoring: the call is sent without it, as 0.13.x sent every call.
+  if conf.send_gateway_metadata ~= false then
+    local ok, gateway = pcall(gateway_metadata)
+    if ok then
+      ctx.straiker_gateway = gateway
+    else
+      log_warn("could not read gateway metadata: %s", tostring(gateway))
+    end
+  end
 
   if conf.debug_preamble then
     local sys, shape = req.system, type(req.system)
@@ -817,7 +749,7 @@ function Straiker:access(conf)
   local scored = {}
   for k, v in pairs(req) do scored[k] = v end
   local verdict, err = score(conf, with_identity(conf, ctx, scored),
-                             ctx.straiker_cc_session, ctx.straiker_agent)
+                             ctx.straiker_cc_session)
   if not verdict then
     return degraded(conf, "request", err, req.model, ctx.straiker_streaming)
   end
@@ -888,7 +820,7 @@ if MODE == "buffered" then
     if not body or body == "" then return end
 
     local verdict, err = score(conf, answer_envelope(conf, ctx, body, PHASE_BUFFERED),
-                               ctx.straiker_cc_session, ctx.straiker_agent)
+                               ctx.straiker_cc_session)
     if not verdict then
       return degraded(conf, "response", err, ctx.straiker_model, ctx.straiker_streaming)
     end
@@ -958,7 +890,6 @@ else
     -- Pulled out of ctx HERE, while the request still exists. The timer below gets
     -- a fresh ngx.ctx, so anything it needs has to be an upvalue by then.
     local cc_session = ctx.straiker_cc_session
-    local agent = ctx.straiker_agent
 
     -- ⚠️ Cosockets are UNAVAILABLE in `log_by_lua`. `resty.http` there fails with
     -- "API disabled in the context of log_by_lua*", the phase aborts, and the
@@ -968,7 +899,7 @@ else
     -- by the time a timer runs, the answer has long since left.
     local ok, err = ngx.timer.at(0, function(premature)
       if premature then return end
-      local verdict, serr = score(conf, payload, cc_session, agent)
+      local verdict, serr = score(conf, payload, cc_session)
       if not verdict then
         log_warn("relay scoring failed: %s", serr or "unknown")
       elseif blocked(verdict) then

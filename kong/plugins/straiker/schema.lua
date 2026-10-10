@@ -132,19 +132,7 @@ return {
           -- documents for request-transformer, reproduced in our own schema. Any field
           -- that a `.env` value reaches has to carry this flag.
           type = "string", referenceable = true,
-          description = "Fallback user when no user_from source names one, e.g. user@example.com.",
-      } },
-      { user_from = {
-          -- Where the user comes from, tried in order; `user_ref` after them. Only what an
-          -- auth plugin established: the Consumer, its custom_id, or a claim of the token
-          -- an auth plugin verified (jwt, openid-connect). Never a request header -- on an
-          -- unauthenticated route that would let the caller name themselves.
-          type = "array", default = { "consumer" },
-          elements = { type = "string", match_any = {
-            patterns = { "^consumer$", "^consumer_custom_id$", "^jwt:.+$" },
-            err = "must be consumer, consumer_custom_id or jwt:<claim>",
-          } },
-          description = "Where the user comes from, in order: consumer, consumer_custom_id, jwt:<claim>. user_ref is used after these.",
+          description = "Fallback attribution when no Kong Consumer is resolved, e.g. user@example.com.",
       } },
       { session_from_body = {
           -- A digest of the preamble plus the first user message. Stable across the
@@ -154,6 +142,13 @@ return {
           description = "Derive a stable session id when the client sends no header.",
       } },
 
+      { send_gateway_metadata = {
+          -- The Route, Service, Consumer, verified token claims, User-Agent and request id,
+          -- sent as `annotations.gateway` so Straiker can attribute the call. Straiker
+          -- records `annotations` and never scores them. IDs and names only.
+          type = "boolean", default = true,
+          description = "Send the Route, Service, Consumer, verified token claims, User-Agent and request id to Straiker as annotations.gateway, for attribution. IDs and names only, never credentials.",
+      } },
       { debug_preamble = {
           -- Logs how the request identifies itself: the shape of `system` and its
           -- first bytes. That is what decides which client Straiker believes sent
@@ -196,25 +191,7 @@ return {
           -- this value, so sharing it across several agents merges them into one.
           -- Scope it per-route, not per-gateway.
           type = "string",
-          description = "Optional x-s6r-agent. Names one agent; scope it to a route. Wins over agent_from.",
-      } },
-      { agent_from = {
-          -- Where the agent name comes from when `agent_ref` is not set, tried in order.
-          -- The first source that names something wins; when none does, Straiker derives
-          -- the agent from the traffic (`Autonomous (kong)`, `claude (kong)`), as before.
-          --
-          -- Gateway-established sources: consumer, consumer_custom_id, route, service, and
-          -- jwt:<claim> from a token an auth plugin verified. `header:<name>` reads a
-          -- header the CALLER sets; list it only where callers are trusted to name
-          -- themselves. Empty (the default) keeps 0.13.x behaviour. Never applied to a
-          -- recognised coding agent (handler.lua `coding_agent`): one agent per tool.
-          type = "array", default = {},
-          elements = { type = "string", match_any = {
-            patterns = { "^consumer$", "^consumer_custom_id$", "^route$", "^service$",
-                         "^jwt:.+$", "^header:[%w_%-]+$" },
-            err = "must be consumer, consumer_custom_id, route, service, jwt:<claim> or header:<name>",
-          } },
-          description = "Where the agent name comes from when agent_ref is unset, in order: consumer, consumer_custom_id, route, service, jwt:<claim>, header:<name>. Never applied to coding agents (Claude Code, Codex), which stay one agent per tool.",
+          description = "Optional x-s6r-agent. Names one agent; scope it to a route.",
       } },
       { format_hint = {
           -- Only consulted where structure cannot decide, which is the OpenAI /
