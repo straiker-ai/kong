@@ -142,6 +142,13 @@ return {
           description = "Derive a stable session id when the client sends no header.",
       } },
 
+      { send_gateway_metadata = {
+          -- The Route, Service, Consumer, verified token claims, User-Agent and request id,
+          -- sent as `annotations.gateway` so Straiker can attribute the call. Straiker
+          -- records `annotations` and never scores them. IDs and names only.
+          type = "boolean", default = true,
+          description = "Send the Route, Service, Consumer, verified token claims, User-Agent and request id to Straiker as annotations.gateway, for attribution. IDs and names only, never credentials.",
+      } },
       { debug_preamble = {
           -- Logs how the request identifies itself: the shape of `system` and its
           -- first bytes. That is what decides which client Straiker believes sent

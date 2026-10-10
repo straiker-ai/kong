@@ -1,5 +1,5 @@
 package = "kong-plugin-straiker"
-version = "0.13.0-1"
+version = "0.14.0-1"
 supported_platforms = { "linux", "macosx" }
 source = {
    url = "file://./",
@@ -44,6 +44,13 @@ tools/check-plugin-layout.sh enforces it.
 
 Enable with:
   KONG_PLUGINS=bundled,straiker
+
+v0.14.0 -- Gateway metadata for attribution. Every scored call carries
+annotations.gateway: the Route and Service it came in on, the Consumer, the app
+and user claims of a token an auth plugin verified, the User-Agent and Kong's
+request id. Straiker records annotations and never scores them, so agents,
+users, sessions and verdicts are unchanged. IDs and names only, never
+credentials. send_gateway_metadata (default true) turns it off.
 
 v0.13.0 -- Straiker's turn details go on Kong's log record (straiker.session_id,
 then straiker.request and straiker.response: action, turn_id, controls,

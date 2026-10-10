@@ -73,7 +73,7 @@ local http  = require "resty.http"
 -- a captured request and a captured relay. A provider where ai-proxy genuinely
 -- reshapes the traffic would hand us its translation on both halves. If the raw
 -- client bytes must be guaranteed, keep ai-proxy off that route.
-local Straiker = { PRIORITY = 760, VERSION = "0.13.0" }
+local Straiker = { PRIORITY = 760, VERSION = "0.14.0" }
 
 -- Read ONCE, at module load. See the header for why this cannot be config.
 local MODE = os.getenv("STRAIKER_KONG_MODE")
@@ -207,15 +207,106 @@ local function hint_headers(conf, session)
   return headers
 end
 
+-- ---------------------------------------------------------------------------
+-- Gateway metadata: what Kong knows about the call, for Straiker to attribute it.
+--
+-- Sent as `annotations.gateway` on every scored half: the Route and Service the call
+-- came in on, the Consumer an auth plugin resolved, the app and user claims of a token
+-- an auth plugin verified, the User-Agent and Kong's request id. Facts only: the plugin
+-- names nothing from them, so the agent is still `agent_ref` or what Straiker derives
+-- from the traffic, and the user is still the Consumer or `user_ref`. IDs and names
+-- only, never a credential, a token, or any other header.
+--
+-- `annotations` is recorded, never scored (v3 Detect reference). A call carrying it is
+-- named and scored exactly as one without it (measured 2026-10-09 on a v3 tenant).
+--
+-- Built once, in `access`, and carried in `ngx.ctx`: the streaming relay sends from a
+-- timer, where `kong.router`, `kong.client` and `kong.request` do not exist.
+-- ---------------------------------------------------------------------------
+local NAME_MAX = 200
+local USER_AGENT_MAX = 256
+-- App claims (Microsoft Entra ID app-only tokens carry `appid` or `azp`, sometimes
+-- `app_displayname`) and user claims (`email`, `upn`, `preferred_username`).
+local TOKEN_CLAIMS = { "iss", "azp", "appid", "app_displayname", "client_id",
+                       "email", "upn", "preferred_username" }
+
+-- A value fit to send: trimmed, single-line, bounded.
+local function clean(v, max)
+  if type(v) == "number" then v = tostring(v) end
+  if type(v) ~= "string" then return nil end
+  v = (v:gsub("^%s+", ""):gsub("%s+$", ""))
+  if v == "" or v:find("%c") then return nil end
+  max = max or NAME_MAX
+  if #v > max then v = v:sub(1, max) end
+  return v
+end
+
+-- The claims of the token an auth plugin verified, or nil. Never the raw header.
+--
+-- Kong 3.15+ decodes it for us (`kong.client.get_jwt_token_payload`). Earlier releases
+-- only keep the verified compact token in `kong.ctx.shared.authenticated_jwt_token`
+-- (the `jwt` and `openid-connect` plugins set it), so decode that. Either way the
+-- token is one an auth plugin already accepted: the signature was checked there.
+local function verified_claims()
+  local client = kong.client
+  if client and client.get_jwt_token_payload then
+    local ok, payload = pcall(client.get_jwt_token_payload)
+    if ok and type(payload) == "table" then return payload end
+  end
+  local shared = kong.ctx and kong.ctx.shared
+  local token = shared and shared.authenticated_jwt_token
+  if type(token) ~= "string" then return nil end
+  local segment = token:match("^[^.]+%.([^.]+)%.")
+  if not segment then return nil end
+  segment = segment:gsub("%-", "+"):gsub("_", "/")
+  local rem = #segment % 4
+  if rem > 0 then segment = segment .. string.rep("=", 4 - rem) end
+  local raw = ngx.decode_base64(segment)
+  local claims = raw and cjson.decode(raw)
+  return type(claims) == "table" and claims or nil
+end
+
+-- The named fields of a Kong entity that have a value, or nil when none do.
+local function entity(e, fields)
+  if type(e) ~= "table" then return nil end
+  local out
+  for _, f in ipairs(fields) do
+    local v = clean(e[f])
+    if v then out = out or {}; out[f] = v end
+  end
+  return out
+end
+
+local function gateway_metadata()
+  local claims, token = verified_claims(), nil
+  if claims then
+    for _, name in ipairs(TOKEN_CLAIMS) do
+      local v = clean(claims[name])
+      if v then token = token or {}; token[name] = v end
+    end
+  end
+  local has_id, request_id = pcall(kong.request.get_id)
+  return {
+    type           = "kong",
+    plugin_version = Straiker.VERSION,
+    route          = entity(kong.router.get_route(), { "id", "name" }),
+    service        = entity(kong.router.get_service(), { "id", "name" }),
+    consumer       = entity(kong.client.get_consumer(), { "id", "username", "custom_id" }),
+    token          = token,
+    user_agent     = clean(kong.request.get_header("user-agent"), USER_AGENT_MAX),
+    request_id     = has_id and clean(request_id) or nil,
+  }
+end
+
 -- The identity a relayed body cannot carry, added to the DETECT payload only.
 --
--- ⚠️ **Neither of these travels upstream.** The model sees the client's bytes
+-- ⚠️ **None of these travels upstream.** The model sees the client's bytes
 -- unchanged; only the copy posted to Straiker is enriched. Mutating the forwarded
 -- body would change what the model is asked, which a security transport must not do.
 --
--- Adding these does not change how the payload is classified: neither field is a
--- format discriminator, so a Messages body enriched this way is still read as a
--- Messages body. Verified rather than assumed.
+-- Adding these does not change how the payload is classified: none of `session_id`,
+-- `original` or `annotations` is a format discriminator, so a Messages body enriched
+-- this way is still read as a Messages body. Verified rather than assumed.
 -- Who the turn is about.
 --
 -- The Kong Consumer first. This plugin's priority (760) sits below the auth plugins
@@ -243,6 +334,14 @@ end
 
 local function with_identity(conf, ctx, payload)
   if ctx.straiker_session then payload.session_id = ctx.straiker_session end
+  -- `annotations` on this copy is the gateway's alone. A client could otherwise send
+  -- its own `annotations.gateway` and claim another route or Consumer, so whatever the
+  -- client put there is dropped, with gateway metadata on or off. Neither Anthropic
+  -- Messages nor OpenAI chat defines the field, and the model never sees this copy.
+  payload.annotations = nil
+  if ctx.straiker_gateway then
+    payload.annotations = { gateway = ctx.straiker_gateway }
+  end
   local user = acting_user(conf)
   if user then
     -- The one place Straiker looks for a user on a relayed request: v3 has no user
@@ -618,6 +717,16 @@ function Straiker:access(conf)
   -- Read HERE, in a real phase, because the streaming relay runs in a timer where
   -- `kong.request` is unavailable. See `hint_headers`.
   ctx.straiker_cc_session = kong.request.get_header("x-claude-code-session-id")
+  -- What Kong knows about this call, for Straiker to attribute it. A failure here never
+  -- stops scoring: the call is sent without it, as 0.13.x sent every call.
+  if conf.send_gateway_metadata ~= false then
+    local ok, gateway = pcall(gateway_metadata)
+    if ok then
+      ctx.straiker_gateway = gateway
+    else
+      log_warn("could not read gateway metadata: %s", tostring(gateway))
+    end
+  end
 
   if conf.debug_preamble then
     local sys, shape = req.system, type(req.system)

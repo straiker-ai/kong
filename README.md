@@ -159,6 +159,7 @@ Declare `protocols: ["http", "https"]` on each route. With no `protocols`, Kong 
 | `upstream_key_header` | No | `x-api-key` | Header to carry it. `x-api-key` for Anthropic, `authorization` for OpenAI-style |
 | `user_ref` | No | — | Fallback attribution, used only when no Kong Consumer is resolved. On an authenticated route the Consumer wins. Vault-referenceable |
 | `session_from_body` | No | `true` | Derive a stable session id when the client sends no header |
+| `send_gateway_metadata` | No | `true` | Send the Route, Service, Consumer, verified token claims, User-Agent and request id to Straiker as `annotations.gateway`, for attribution. IDs and names only. See [Gateway metadata](#gateway-metadata) |
 | `debug_preamble` | No | `false` | Log the system-prompt shape and lead, to explain client resolution. **Prints prompt content to the Kong log** |
 | `client` | No | — | Optional `x-s6r-client`. Leave unset on a shared gateway; set it on a single-app route |
 | `agent_ref` | No | — | Optional `x-s6r-agent`. Names **one** agent; scope it to a route |
@@ -173,6 +174,40 @@ Kong resolves `{vault://env/…}` only on fields declared `referenceable`, and `
 Leave `client` and `agent_ref` unset when one Kong fronts several different applications: Straiker identifies the client from the request's own system prompt, and pinning one value forces every surface onto it. Set them on a route that fronts exactly one known application, where structure alone would otherwise classify a chat assistant as the broader "autonomous agent" category.
 
 `agent_ref` names one agent, never a kind of agent — Straiker keys per-agent state on it, so sharing a value across several agents merges them into one.
+
+### Gateway metadata
+
+Every scored call tells Straiker what Kong knows about it, so Straiker can attribute the call. On a shared gateway that covers many applications, this answers "which app was this?" from facts rather than from the prompt. The block is sent as `annotations.gateway` in the copy posted to Straiker:
+
+```json
+"annotations": {
+  "gateway": {
+    "type": "kong",
+    "plugin_version": "0.14.0",
+    "route":    { "id": "8f3c2a10-…", "name": "claims-intake" },
+    "service":  { "id": "41aa…", "name": "openai" },
+    "consumer": { "id": "a9e1…", "username": "claims-svc", "custom_id": "svc-1001" },
+    "token":    { "iss": "https://login.microsoftonline.com/…/v2.0", "azp": "…", "email": "dana@example.com" },
+    "user_agent": "claude-cli/2.1.295 (external, cli)",
+    "request_id": "…"
+  }
+}
+```
+
+| Field | From | Present when |
+|---|---|---|
+| `route`, `service` | The matched Route and Service | Always |
+| `consumer` | The Consumer an auth plugin resolved | The route has an auth plugin |
+| `token` | `iss`, `azp`, `appid`, `app_displayname`, `client_id`, `email`, `upn`, `preferred_username` of the token an auth plugin **verified** (`jwt`, `openid-connect`) | A verified token carries them |
+| `user_agent` | The request's `User-Agent`, up to 256 characters | The client sent one |
+| `request_id` | Kong's request id, the same value as `x-kong-request-id` and the log record's `request.id` | Kong 3.x |
+
+- **Facts only.** The plugin names nothing from them. The agent is still `agent_ref` or what Straiker derives from the traffic, and the user is still the Consumer or `user_ref`.
+- **Recorded, never scored.** Straiker records `annotations` and does not score them, so verdicts, agents, users and sessions are unchanged.
+- **IDs and names only.** Never a credential, a token, or any other header.
+- **Never travels upstream.** The model receives the client's request unchanged.
+- **Cannot be spoofed by the client.** Any `annotations` the client sends are dropped from the copy posted to Straiker, whether gateway metadata is on or off.
+- **Turn it off** with `send_gateway_metadata: false`.
 
 ### Enable
 
@@ -336,7 +371,7 @@ docker build -f Dockerfile.konnect -t kong-straiker:latest .
 ### LuaRocks
 
 ```sh
-luarocks make kong-plugin-straiker-0.13.0-1.rockspec
+luarocks make kong-plugin-straiker-0.14.0-1.rockspec
 export KONG_PLUGINS=bundled,straiker
 kong reload
 ```
@@ -344,7 +379,7 @@ kong reload
 From a release (when published):
 
 ```sh
-luarocks install https://github.com/straiker-ai/kong/releases/download/v0.13.0/kong-plugin-straiker-0.13.0-1.all.rock
+luarocks install https://github.com/straiker-ai/kong/releases/download/v0.14.0/kong-plugin-straiker-0.14.0-1.all.rock
 ```
 
 ### Konnect hybrid
@@ -435,6 +470,10 @@ curl -i -X POST http://localhost:8000/v1/messages \
 You want HTTP 200 and `x-straiker-verdict: allow`. Keep `max_tokens` generous while testing: a reply truncated at `stop_reason: max_tokens` looks like a block at a glance.
 
 ---
+
+## Upgrading from 0.13.x
+
+No config changes. Every scored call now carries `annotations.gateway`; see [Gateway metadata](#gateway-metadata). On Konnect, upload the 0.14.0 `schema.lua` so the new `send_gateway_metadata` field is accepted.
 
 ## Upgrading from 0.12.x
 
