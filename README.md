@@ -159,6 +159,7 @@ Declare `protocols: ["http", "https"]` on each route. With no `protocols`, Kong 
 | `upstream_key_header` | No | `x-api-key` | Header to carry it. `x-api-key` for Anthropic, `authorization` for OpenAI-style |
 | `user_ref` | No | — | Fallback attribution, used only when no Kong Consumer is resolved. On an authenticated route the Consumer wins. Vault-referenceable |
 | `session_from_body` | No | `true` | Derive a stable session id when the client sends no header |
+| `trust_agent_header` | No | `false` | Use the caller's `x-s6r-agent` header as the agent name when `agent_ref` is unset. Turn it on only where callers are trusted to name themselves. Never applied to Claude Code or Codex. See [Naming applications](#naming-applications) |
 | `send_gateway_metadata` | No | `true` | Send the Route, Service, Consumer, verified token claims, User-Agent and request id to Straiker as `annotations.gateway`, for attribution. IDs and names only. See [Gateway metadata](#gateway-metadata) |
 | `debug_preamble` | No | `false` | Log the system-prompt shape and lead, to explain client resolution. **Prints prompt content to the Kong log** |
 | `client` | No | — | Optional `x-s6r-client`. Leave unset on a shared gateway; set it on a single-app route |
@@ -175,6 +176,38 @@ Leave `client` and `agent_ref` unset when one Kong fronts several different appl
 
 `agent_ref` names one agent, never a kind of agent — Straiker keys per-agent state on it, so sharing a value across several agents merges them into one.
 
+### Naming applications
+
+| | Automatic (default) | Manual: `x-s6r-agent` |
+|---|---|---|
+| Who does it | Nobody. The plugin sends [gateway metadata](#gateway-metadata) on every call | The application team, or the gateway operator |
+| How | Nothing to configure | The app sends `x-s6r-agent: <name>` on a route with `trust_agent_header: true`, or the gateway adds it (`agent_ref`, or `request-transformer` plus `trust_agent_header`) |
+| Today | Unnamed applications land in `Autonomous (kong)`; Straiker keeps the route, Consumer and token facts for attribution | Each named application is its own agent |
+
+Order, first match wins: `agent_ref` on the route, then the caller's `x-s6r-agent` where `trust_agent_header` is on, then what Straiker derives from the traffic. A coding agent (Claude Code, Codex) never takes the caller's header: it stays one agent per tool, with the developer as the user. An application built on the Claude Agent SDK (`User-Agent` entrypoint `sdk-py` / `sdk-ts`) is an application, so its header is used.
+
+```yaml
+# The app names itself.
+- name: straiker
+  route: returns-desk
+  config: { trust_agent_header: true, ... }
+
+# The gateway names it, with no app change: agent_ref ...
+- name: straiker
+  route: claims-intake
+  config: { agent_ref: "Claims Intake Agent", ... }
+
+# ... or a header the gateway adds.
+- name: request-transformer
+  route: loyalty
+  config: { add: { headers: ["x-s6r-agent:Loyalty Desk Agent"] } }
+- name: straiker
+  route: loyalty
+  config: { trust_agent_header: true, ... }
+```
+
+`trust_agent_header` is off by default because the caller sets the header: on an untrusted route, any client could file its traffic under another application's agent and controls. Whatever the caller sent is still recorded as `annotations.gateway.agent_header`, trusted or not.
+
 ### Gateway metadata
 
 Every scored call tells Straiker what Kong knows about it, so Straiker can attribute the call. On a shared gateway that covers many applications, this answers "which app was this?" from facts rather than from the prompt. The block is sent as `annotations.gateway` in the copy posted to Straiker:
@@ -189,6 +222,7 @@ Every scored call tells Straiker what Kong knows about it, so Straiker can attri
     "consumer": { "id": "a9e1…", "username": "claims-svc", "custom_id": "svc-1001" },
     "token":    { "iss": "https://login.microsoftonline.com/…/v2.0", "azp": "…", "email": "dana@example.com" },
     "user_agent": "claude-cli/2.1.295 (external, cli)",
+    "agent_header": "Claims Intake Agent",
     "request_id": "…"
   }
 }
@@ -200,6 +234,7 @@ Every scored call tells Straiker what Kong knows about it, so Straiker can attri
 | `consumer` | The Consumer an auth plugin resolved | The route has an auth plugin |
 | `token` | `iss`, `azp`, `appid`, `app_displayname`, `client_id`, `email`, `upn`, `preferred_username` of the token an auth plugin **verified** (`jwt`, `openid-connect`) | A verified token carries them |
 | `user_agent` | The request's `User-Agent`, up to 256 characters | The client sent one |
+| `agent_header` | The caller's own `x-s6r-agent`, as sent, whether or not the route trusts it | The client sent one |
 | `request_id` | Kong's request id, the same value as `x-kong-request-id` and the log record's `request.id` | Kong 3.x |
 
 - **Facts only.** The plugin names nothing from them. The agent is still `agent_ref` or what Straiker derives from the traffic, and the user is still the Consumer or `user_ref`.

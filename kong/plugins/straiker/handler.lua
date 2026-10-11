@@ -192,13 +192,15 @@ end
 -- logged at error level under `[timer-ng]` rather than under the plugin, and with
 -- nothing reaching Detect. Streaming mode was scoring the prompt and silently
 -- nothing else. Capture in `access`, where the phase is real, and carry the value.
-local function hint_headers(conf, session)
+local function hint_headers(conf, session, agent)
   local headers = {
     ["Content-Type"]  = "application/json",
     ["Authorization"] = "Bearer " .. conf.api_key,
   }
   if conf.client      then headers["x-s6r-client"] = conf.client end
-  if conf.agent_ref   then headers["x-s6r-agent"]  = conf.agent_ref end
+  -- `agent` is `agent_ref`, or the caller's header where `trust_agent_header` allows it.
+  -- Resolved once, in `access`; see `agent_name`. Passed in for the reason `session` is.
+  if agent            then headers["x-s6r-agent"]  = agent end
   if conf.format_hint then headers["x-s6r-format"] = conf.format_hint end
 
   -- Forwarded when the client sends it: it is how a coding session groups, and the
@@ -294,8 +296,42 @@ local function gateway_metadata()
     consumer       = entity(kong.client.get_consumer(), { "id", "username", "custom_id" }),
     token          = token,
     user_agent     = clean(kong.request.get_header("user-agent"), USER_AGENT_MAX),
+    -- The caller's own `x-s6r-agent`, as sent, trusted or not: a claim Straiker can set
+    -- beside the route it actually came in on.
+    agent_header   = clean(kong.request.get_header("x-s6r-agent")),
     request_id     = has_id and clean(request_id) or nil,
   }
+end
+
+-- Coding agents, from the User-Agent their CLI sends on every call (captured
+-- 2026-10-09). A coding agent is ONE agent per tool, with each developer as the user, so
+-- the caller's own `x-s6r-agent` never renames it. Claude Code names its entrypoint in
+-- the User-Agent: `cli` (terminal), `claude-vscode`, `sdk-cli` (`claude -p`). `sdk-py` and
+-- `sdk-ts` are applications a team built on the Claude Agent SDK, which runs the same
+-- binary: those are the team's own agents. Codex sends `codex_exec/...`.
+local SDK_APP_ENTRYPOINTS = { ["sdk-py"] = true, ["sdk-ts"] = true }
+
+local function coding_agent()
+  local ua = kong.request.get_header("user-agent")
+  if type(ua) ~= "string" then return false end
+  ua = ua:lower()
+  if ua:sub(1, 11) == "claude-cli/" then
+    local entrypoint = ua:match("%(external,%s*([%w_%-]+)")
+    return not (entrypoint and SDK_APP_ENTRYPOINTS[entrypoint])
+  end
+  return ua:sub(1, 6) == "codex_"
+end
+
+-- The agent name sent as `x-s6r-agent`: the route's `agent_ref`, else -- only where the
+-- operator turned on `trust_agent_header` -- the caller's own `x-s6r-agent`. Off by
+-- default because the caller sets it: on an untrusted route it would let any client file
+-- its traffic under another application's agent and controls.
+local function agent_name(conf)
+  if conf.agent_ref then return conf.agent_ref end
+  if conf.trust_agent_header and not coding_agent() then
+    return clean(kong.request.get_header("x-s6r-agent"))
+  end
+  return nil
 end
 
 -- The identity a relayed body cannot carry, added to the DETECT payload only.
@@ -438,7 +474,7 @@ end
 -- Returns the decoded verdict, or nil plus an error string.
 -- `session` is the client's `x-claude-code-session-id`, captured in `access`; see
 -- `hint_headers` for why it cannot be read here.
-local function score(conf, payload, session)
+local function score(conf, payload, session, agent)
   local body = cjson.encode(payload)
   if not body then return nil, "could not encode the payload" end
   if #body > conf.max_body_bytes then
@@ -448,7 +484,7 @@ local function score(conf, payload, session)
   local httpc = http.new()
   httpc:set_timeout(conf.timeout_ms)
 
-  local headers = hint_headers(conf, session)
+  local headers = hint_headers(conf, session, agent)
   headers["Content-Length"] = #body
 
   local res, err = httpc:request_uri(conf.detect_url, {
@@ -717,6 +753,8 @@ function Straiker:access(conf)
   -- Read HERE, in a real phase, because the streaming relay runs in a timer where
   -- `kong.request` is unavailable. See `hint_headers`.
   ctx.straiker_cc_session = kong.request.get_header("x-claude-code-session-id")
+  -- The agent name, resolved here, in a real phase, for every half that is scored.
+  ctx.straiker_agent = agent_name(conf)
   -- What Kong knows about this call, for Straiker to attribute it. A failure here never
   -- stops scoring: the call is sent without it, as 0.13.x sent every call.
   if conf.send_gateway_metadata ~= false then
@@ -749,7 +787,7 @@ function Straiker:access(conf)
   local scored = {}
   for k, v in pairs(req) do scored[k] = v end
   local verdict, err = score(conf, with_identity(conf, ctx, scored),
-                             ctx.straiker_cc_session)
+                             ctx.straiker_cc_session, ctx.straiker_agent)
   if not verdict then
     return degraded(conf, "request", err, req.model, ctx.straiker_streaming)
   end
@@ -820,7 +858,7 @@ if MODE == "buffered" then
     if not body or body == "" then return end
 
     local verdict, err = score(conf, answer_envelope(conf, ctx, body, PHASE_BUFFERED),
-                               ctx.straiker_cc_session)
+                               ctx.straiker_cc_session, ctx.straiker_agent)
     if not verdict then
       return degraded(conf, "response", err, ctx.straiker_model, ctx.straiker_streaming)
     end
@@ -890,6 +928,7 @@ else
     -- Pulled out of ctx HERE, while the request still exists. The timer below gets
     -- a fresh ngx.ctx, so anything it needs has to be an upvalue by then.
     local cc_session = ctx.straiker_cc_session
+    local agent = ctx.straiker_agent
 
     -- ⚠️ Cosockets are UNAVAILABLE in `log_by_lua`. `resty.http` there fails with
     -- "API disabled in the context of log_by_lua*", the phase aborts, and the
@@ -899,7 +938,7 @@ else
     -- by the time a timer runs, the answer has long since left.
     local ok, err = ngx.timer.at(0, function(premature)
       if premature then return end
-      local verdict, serr = score(conf, payload, cc_session)
+      local verdict, serr = score(conf, payload, cc_session, agent)
       if not verdict then
         log_warn("relay scoring failed: %s", serr or "unknown")
       elseif blocked(verdict) then

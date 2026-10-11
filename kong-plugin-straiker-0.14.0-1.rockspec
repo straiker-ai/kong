@@ -51,6 +51,8 @@ and user claims of a token an auth plugin verified, the User-Agent and Kong's
 request id. Straiker records annotations and never scores them, so agents,
 users, sessions and verdicts are unchanged. IDs and names only, never
 credentials. send_gateway_metadata (default true) turns it off.
+trust_agent_header (default false) uses the caller's x-s6r-agent as the agent
+name where agent_ref is unset; never for Claude Code or Codex.
 
 v0.13.0 -- Straiker's turn details go on Kong's log record (straiker.session_id,
 then straiker.request and straiker.response: action, turn_id, controls,
