@@ -142,6 +142,21 @@ return {
           description = "Derive a stable session id when the client sends no header.",
       } },
 
+      { trust_agent_header = {
+          -- Use the caller's `x-s6r-agent` as the agent name when `agent_ref` is unset.
+          -- The caller sets it, so it is off by default: turn it on only on routes whose
+          -- callers are trusted to name themselves. Never applied to a coding agent
+          -- (Claude Code, Codex), which stays one agent per tool.
+          type = "boolean", default = false,
+          description = "Use the caller's x-s6r-agent header as the agent name when agent_ref is unset. Turn on only where callers are trusted to name themselves. Never applied to Claude Code or Codex.",
+      } },
+      { send_gateway_metadata = {
+          -- The Route, Service, Consumer, verified token claims, User-Agent and request id,
+          -- sent as `annotations.gateway` so Straiker can attribute the call. Straiker
+          -- records `annotations` and never scores them. IDs and names only.
+          type = "boolean", default = true,
+          description = "Send the Route, Service, Consumer, verified token claims, User-Agent and request id to Straiker as annotations.gateway, for attribution. IDs and names only, never credentials.",
+      } },
       { debug_preamble = {
           -- Logs how the request identifies itself: the shape of `system` and its
           -- first bytes. That is what decides which client Straiker believes sent
