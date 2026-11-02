@@ -214,10 +214,11 @@ end
 --
 -- Sent as `annotations.gateway` on every scored half: the Route and Service the call
 -- came in on, the Consumer an auth plugin resolved, the app and user claims of a token
--- an auth plugin verified, the User-Agent and Kong's request id. Facts only: the plugin
--- names nothing from them, so the agent is still `agent_ref` or what Straiker derives
--- from the traffic, and the user is still the Consumer or `user_ref`. IDs and names
--- only, never a credential, a token, or any other header.
+-- an auth plugin verified, the User-Agent, the client headers named in `client_headers`
+-- and Kong's request id. Facts only: the plugin names nothing from them, so the agent is
+-- still `agent_ref` or what Straiker derives from the traffic, and the user is still the
+-- Consumer or `user_ref`. IDs and names only, never a credential, a token, or any header
+-- `client_headers` does not name.
 --
 -- `annotations` is recorded, never scored (v3 Detect reference). A call carrying it is
 -- named and scored exactly as one without it (measured 2026-10-09 on a v3 tenant).
@@ -279,7 +280,34 @@ local function entity(e, fields)
   return out
 end
 
-local function gateway_metadata()
+-- Words that mark a header as one that may carry a credential. Kept identical to the
+-- list in schema.lua, which refuses such a name in `client_headers`; checked here again
+-- so a config that predates the check still cannot list a key into the payload.
+local CREDENTIAL_WORDS = { "auth", "key", "token", "secret", "cookie", "passw",
+                           "credential", "signature" }
+
+-- The headers `client_headers` names that the client sent, keyed by lower-case name,
+-- or nil when it sent none of them. These are how a client says what it is beyond the
+-- User-Agent (Codex `originator`, Claude Code `x-app`) and which conversation a call
+-- belongs to (OpenCode `x-session-id`, Codex `session-id`), captured 2026-11-02.
+local function client_headers(names)
+  if type(names) ~= "table" then return nil end
+  local out
+  for _, name in ipairs(names) do
+    name = type(name) == "string" and name:lower() or ""
+    local secret = name == ""
+    for _, word in ipairs(CREDENTIAL_WORDS) do
+      if name:find(word, 1, true) then secret = true; break end
+    end
+    if not secret then
+      local v = clean(kong.request.get_header(name), USER_AGENT_MAX)
+      if v then out = out or {}; out[name] = v end
+    end
+  end
+  return out
+end
+
+local function gateway_metadata(conf)
   local claims, token = verified_claims(), nil
   if claims then
     for _, name in ipairs(TOKEN_CLAIMS) do
@@ -299,6 +327,7 @@ local function gateway_metadata()
     -- The caller's own `x-s6r-agent`, as sent, trusted or not: a claim Straiker can set
     -- beside the route it actually came in on.
     agent_header   = clean(kong.request.get_header("x-s6r-agent")),
+    client_headers = client_headers(conf.client_headers),
     request_id     = has_id and clean(request_id) or nil,
   }
 end
@@ -409,9 +438,30 @@ end
 -- client's own id, so it survives load balancing. Falling back to a digest keeps
 -- surfaces that send no header -- the desktop app among them -- from being given a
 -- fresh, synthetic session on every request, which groups nothing.
+--
+-- Other coding agents state their session too (captured 2026-11-02): OpenCode sends
+-- `x-session-id` on every call, the SAME id on its title call and on the conversation
+-- that call titles, and Codex sends `session-id`. Without them each OpenCode
+-- conversation became two sessions, because the title call carries its own system
+-- prompt and so digests differently.
+local CLIENT_SESSION_HEADERS = { "x-session-id", "session-id" }
+
 local function conversation_id(conf, req)
   local supplied = kong.request.get_header("x-claude-code-session-id")
   if supplied and supplied ~= "" then return supplied end
+
+  -- ⚠️ **Scoped to the caller, unlike Claude Code's header.** `x-session-id` is a
+  -- generic name, and an application can send one value for every user. Used as is,
+  -- that would put every user in one session, and Straiker skips a turn it has
+  -- already scored in the same session: the second user's copy of a blocked prompt
+  -- would come back as a replay. The same reason the digest below seeds on the caller.
+  for _, name in ipairs(CLIENT_SESSION_HEADERS) do
+    local stated = clean(kong.request.get_header(name), USER_AGENT_MAX)
+    if stated then
+      return "kong-" .. ngx.md5(tostring(acting_user(conf) or "") .. "\0" .. name
+                                .. "\0" .. stated)
+    end
+  end
   if not conf.session_from_body then return nil end
 
   -- The client's own id, when it states one. Only reachable on the REQUEST half:
@@ -758,7 +808,7 @@ function Straiker:access(conf)
   -- What Kong knows about this call, for Straiker to attribute it. A failure here never
   -- stops scoring: the call is sent without it, as 0.13.x sent every call.
   if conf.send_gateway_metadata ~= false then
-    local ok, gateway = pcall(gateway_metadata)
+    local ok, gateway = pcall(gateway_metadata, conf)
     if ok then
       ctx.straiker_gateway = gateway
     else

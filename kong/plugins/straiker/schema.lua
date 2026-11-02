@@ -12,6 +12,25 @@
 -- below. `api.lua`, `dao.lua` and `migrations.lua` are prohibited too. We have none,
 -- and the whole plugin is two files for that reason.
 
+-- Words that mark a header as one that may carry a credential. Kept identical to the
+-- list in handler.lua, which skips such a name at runtime too.
+local CREDENTIAL_WORDS = { "auth", "key", "token", "secret", "cookie", "passw",
+                           "credential", "signature" }
+
+-- A `client_headers` entry: a plain header name that cannot carry a credential.
+local function client_header_name(value)
+  local name = value:lower()
+  if not name:match("^[%w%-]+$") then
+    return nil, "not a header name: " .. value
+  end
+  for _, word in ipairs(CREDENTIAL_WORDS) do
+    if name:find(word, 1, true) then
+      return nil, "may carry a credential, so it is never sent: " .. value
+    end
+  end
+  return true
+end
+
 return {
   name = "straiker",
   fields = {
@@ -156,6 +175,19 @@ return {
           -- records `annotations` and never scores them. IDs and names only.
           type = "boolean", default = true,
           description = "Send the Route, Service, Consumer, verified token claims, User-Agent and request id to Straiker as annotations.gateway, for attribution. IDs and names only, never credentials.",
+      } },
+      { client_headers = {
+          -- Request headers a client uses to say what it is and which conversation a
+          -- call belongs to, sent as `annotations.gateway.client_headers` when
+          -- `send_gateway_metadata` is on. The defaults are what coding agents were
+          -- captured sending on every call (2026-11-02): Codex `originator`, Claude
+          -- Code `x-app`, OpenCode `x-session-id`, Codex `session-id`. Add a client's
+          -- own header here without a plugin release. A name that could carry a
+          -- credential is refused.
+          type = "array", default = { "originator", "x-app", "x-session-id", "session-id" },
+          len_max = 16,
+          elements = { type = "string", custom_validator = client_header_name },
+          description = "Client headers sent to Straiker in annotations.gateway.client_headers, for attribution. Header names only; any name that could carry a credential is refused.",
       } },
       { debug_preamble = {
           -- Logs how the request identifies itself: the shape of `system` and its
