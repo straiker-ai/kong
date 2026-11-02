@@ -158,9 +158,10 @@ Declare `protocols: ["http", "https"]` on each route. With no `protocols`, Kong 
 | `upstream_api_key` | No | — | Model credential the **gateway** holds, injected on the way out. Vault-referenceable |
 | `upstream_key_header` | No | `x-api-key` | Header to carry it. `x-api-key` for Anthropic, `authorization` for OpenAI-style |
 | `user_ref` | No | — | Fallback attribution, used only when no Kong Consumer is resolved. On an authenticated route the Consumer wins. Vault-referenceable |
-| `session_from_body` | No | `true` | Derive a stable session id when the client sends no header |
+| `session_from_body` | No | `true` | Derive a stable session id when the client sends no session header (`x-claude-code-session-id`, `x-session-id`, `session-id`) |
 | `trust_agent_header` | No | `false` | Use the caller's `x-s6r-agent` header as the agent name when `agent_ref` is unset. Turn it on only where callers are trusted to name themselves. Never applied to Claude Code or Codex. See [Naming applications](#naming-applications) |
 | `send_gateway_metadata` | No | `true` | Send the Route, Service, Consumer, verified token claims, User-Agent and request id to Straiker as `annotations.gateway`, for attribution. IDs and names only. See [Gateway metadata](#gateway-metadata) |
+| `client_headers` | No | `originator`, `x-app`, `x-session-id`, `session-id` | Client headers sent in `annotations.gateway.client_headers`, the ones coding agents use to say what they are and which conversation a call belongs to. Add a client's own header without a plugin release. A name that could carry a credential (`auth`, `key`, `token`, `secret`, `cookie`, …) is refused |
 | `debug_preamble` | No | `false` | Log the system-prompt shape and lead, to explain client resolution. **Prints prompt content to the Kong log** |
 | `client` | No | — | Optional `x-s6r-client`. Leave unset on a shared gateway; set it on a single-app route |
 | `agent_ref` | No | — | Optional `x-s6r-agent`. Names **one** agent; scope it to a route |
@@ -223,6 +224,7 @@ Every scored call tells Straiker what Kong knows about it, so Straiker can attri
     "token":    { "iss": "https://login.microsoftonline.com/…/v2.0", "azp": "…", "email": "dana@example.com" },
     "user_agent": "claude-cli/2.1.295 (external, cli)",
     "agent_header": "Claims Intake Agent",
+    "client_headers": { "x-app": "cli" },
     "request_id": "…"
   }
 }
@@ -235,11 +237,12 @@ Every scored call tells Straiker what Kong knows about it, so Straiker can attri
 | `token` | `iss`, `azp`, `appid`, `app_displayname`, `client_id`, `email`, `upn`, `preferred_username` of the token an auth plugin **verified** (`jwt`, `openid-connect`) | A verified token carries them |
 | `user_agent` | The request's `User-Agent`, up to 256 characters | The client sent one |
 | `agent_header` | The caller's own `x-s6r-agent`, as sent, whether or not the route trusts it | The client sent one |
+| `client_headers` | The headers named in `client_headers` (default: Codex `originator`, Claude Code `x-app`, OpenCode `x-session-id`, Codex `session-id`), up to 256 characters each | The client sent at least one |
 | `request_id` | Kong's request id, the same value as `x-kong-request-id` and the log record's `request.id` | Kong 3.x |
 
 - **Facts only.** The plugin names nothing from them. The agent is still `agent_ref` or what Straiker derives from the traffic, and the user is still the Consumer or `user_ref`.
 - **Recorded, never scored.** Straiker records `annotations` and does not score them, so verdicts, agents, users and sessions are unchanged.
-- **IDs and names only.** Never a credential, a token, or any other header.
+- **IDs and names only.** Never a credential, a token, or any header `client_headers` does not name. A `client_headers` entry that could carry a credential is refused when the config loads.
 - **Never travels upstream.** The model receives the client's request unchanged.
 - **Cannot be spoofed by the client.** Any `annotations` the client sends are dropped from the copy posted to Straiker, whether gateway metadata is on or off.
 - **Turn it off** with `send_gateway_metadata: false`.
@@ -508,7 +511,9 @@ You want HTTP 200 and `x-straiker-verdict: allow`. Keep `max_tokens` generous wh
 
 ## Upgrading from 0.13.x
 
-No config changes. Every scored call now carries `annotations.gateway`; see [Gateway metadata](#gateway-metadata). On Konnect, upload the 0.14.0 `schema.lua` so the new `send_gateway_metadata` field is accepted.
+No config changes. Every scored call now carries `annotations.gateway`; see [Gateway metadata](#gateway-metadata). On Konnect, upload the 0.14.0 `schema.lua` so the new `send_gateway_metadata` and `client_headers` fields are accepted.
+
+- **OpenCode and Codex sessions follow the client's own session id.** OpenCode sends `x-session-id` and Codex sends `session-id`; the plugin now groups on them, scoped to the caller, before falling back to the digest. An OpenCode conversation used to become two sessions because its title call digests differently; it is now one. Two Codex runs that opened with the same words used to share a session; each run now has its own. Requests carrying `x-claude-code-session-id` are unaffected.
 
 ## Upgrading from 0.12.x
 

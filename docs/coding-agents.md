@@ -58,7 +58,7 @@ There is deliberately no `x-consumer-username` header fallback. Reading that hea
 
 Do **not** put a per-developer key in `x-api-key` — Claude subscription users send `Authorization: Bearer` and no `x-api-key`. Use a dedicated header such as `apikey` with `hide_credentials: true`, so the key identifies the developer to Kong without being forwarded upstream.
 
-Sessions are different: `x-claude-code-session-id` is used when the client sends it, and otherwise `session_from_body` derives a stable digest from the system preamble plus the first user message. Both are stable across the turns of one conversation, because a transcript grows at the end.
+Sessions are different: `x-claude-code-session-id` is used when the client sends it, then the session OpenCode (`x-session-id`) or Codex (`session-id`) states, scoped to the caller, and otherwise `session_from_body` derives a stable digest from the system preamble plus the first user message. Both are stable across the turns of one conversation, because a transcript grows at the end.
 
 ## Route scoping
 
