@@ -79,7 +79,7 @@ Every response carries `x-straiker-verdict`:
 | `allow` | Scored, nothing fired |
 | `detect` | A control fired while the tenant is in detect mode. **Not** a block, by design |
 | `block` | Enforced. The answer was replaced |
-| `degraded` | Straiker was unreachable or errored, and `fail_closed` is false, so traffic passed **uninspected** |
+| `degraded` | Straiker was unreachable or errored, or the request body could not be read or parsed as JSON, and `fail_closed` is false, so traffic passed **uninspected** |
 | `unknown` | Straiker answered in a shape the plugin could not read. Also uninspected — treat as an incident |
 
 Alert on `degraded` and `unknown`. Both mean the control is not running while the traffic looks healthy.
